@@ -1,0 +1,3 @@
+[ 219715.53ms][engine] Casement · Windows 11 PC can't share this launch with Atelier · Mac apps: offering a restart
+2026-11-22 13:06:16.875 Triptych[19961:6520346] MacAppsKit: dlopen guest: dlopen(<app-path>, 0x0002): tried: '<app-path>' (code signature invalid in <uuid> '<app-path>' (errno=1) sliceOffset=0x00000000, codeBlobOffset=0x0022BAF0, codeBlobSize=0x00004600), '/private/preboot/Cryptexes/OS<app-path>' (no such file), '<app-path>' (code signature invalid in <uuid> '<app-path>' (errno=1) sliceOffset=0x00000000, codeBlobOffs
+[    60.24ms][prev] henge: bugcheck regs x19=fffff802427bbf40 x20=fffff80242657220 x21=50 x22=0 x23=ffff9a047a79d0c0 x24=1 x25=fffff80242657000 x26=fffff80242600690 x27=1 x28=0

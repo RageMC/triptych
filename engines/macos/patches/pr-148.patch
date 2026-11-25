@@ -1,0 +1,128 @@
+diff --git a/ios/Henge/JIT/JITNetworkAdvice.swift b/ios/Henge/JIT/JITNetworkAdvice.swift
+index 18872443..4b15c604 100644
+--- a/ios/Henge/JIT/JITNetworkAdvice.swift
++++ b/ios/Henge/JIT/JITNetworkAdvice.swift
+@@ -63,8 +63,78 @@ enum JITConnectionProblem: Equatable {
+     }
+ }
+ 
++/// A helper failure that is about this device's state, not the network: StikJIT passes the device's own error names
++/// (DeveloperModeNotEnabled, InvalidHostID, ...) or its own sentences through, which mean nothing to most people.
++enum JITDeviceProblem: Equatable {
++    case developerModeOff
++    case locked
++    case trustPending
++    /// The device does not accept this pairing (made for another device, replaced by a newer one, or refused).
++    case pairingRejected
++    /// The pairing file itself could not be read.
++    case pairingFileUnreadable
++    case diskImage
++    /// The connection dropped because the device slept or the screen locked.
++    case slept
++    case debugserver
++
++    init?(helperMessage: String) {
++        let text = helperMessage.lowercased()
++        let has = { (needles: [String]) in needles.contains(where: text.contains) }
++        if has(["developer mode is not enabled", "developermodenotenabled"]) {
++            self = .developerModeOff
++        } else if has(["passwordprotected", "device locked", "devicelocked"]) {
++            self = .locked
++        } else if has(["pairing trust dialog pending", "pairingdialogresponsepending"]) {
++            self = .trustPending
++        } else if has(["invalidhostid", "user denied pairing", "userdeniedpairing", "device does not have pairing file"]) {
++            self = .pairingRejected
++        } else if has(["failed to read pairing file", "pairing file error", "not a remote pairing file"]) {
++            self = .pairingFileUnreadable
++        } else if has(["heartbeat timeout", "device went to sleep"]) {
++            self = .slept
++        } else if has(["disk image", "image not mounted", "imagenotmounted", "ddinotmounted", "ddidownload", "ddifilesmissing"]) {
++            self = .diskImage
++        } else if has(["debugserver connection"]) {
++            self = .debugserver
++        } else {
++            return nil
++        }
++    }
++
++    var advice: JITAdvice {
++        switch self {
++        case .developerModeOff:
++            return JITAdvice(message: "Developer Mode is off. Turn it on in Settings › Privacy & Security › Developer Mode, "
++                                    + "let the device restart and confirm, then try again.", actions: [])
++        case .locked:
++            return JITAdvice(message: "This device was locked. Unlock it, keep Henge open, then try again.", actions: [])
++        case .trustPending:
++            return JITAdvice(message: "This device is waiting for you to trust the pairing. Answer the prompt, "
++                                    + "then try again.", actions: [])
++        case .pairingRejected:
++            return JITAdvice(message: "This device no longer accepts Henge's pairing. That happens after pairing "
++                                    + "another tool, erasing the device, or using a pairing file made for a different device. "
++                                    + "Pair again.", actions: [.pairAgain])
++        case .pairingFileUnreadable:
++            return JITAdvice(message: "Henge's pairing file could not be read. Pair again, or import a fresh pairing file.",
++                             actions: [.pairAgain])
++        case .diskImage:
++            return JITAdvice(message: "The Developer Disk Image could not be downloaded or mounted. Check that this device "
++                                    + "is online, tap Reset Developer Disk Image, then Check setup again.", actions: [])
++        case .slept:
++            return JITAdvice(message: "The connection dropped when this device slept or locked. Keep the screen on with "
++                                    + "Henge open, then try again.", actions: [.connectLocalDevVPN])
++        case .debugserver:
++            return JITAdvice(message: "This device's debugging service did not accept the helper. This usually means the "
++                                    + "Developer Disk Image is not mounted: tap Check setup, then Enable JIT.", actions: [])
++        }
++    }
++}
++
+ enum JITNetworkAdvice {
+     static func advice(forHelperMessage helperMessage: String, situation: NetworkSituation) -> JITAdvice? {
++        if let device = JITDeviceProblem(helperMessage: helperMessage) { return device.advice }
+         guard let problem = JITConnectionProblem(helperMessage: helperMessage) else { return nil }
+         if problem == .pairing {
+             return JITAdvice(
+diff --git a/tests/test_jit_advice.swift b/tests/test_jit_advice.swift
+index 193f0fd1..c301b3ee 100644
+--- a/tests/test_jit_advice.swift
++++ b/tests/test_jit_advice.swift
+@@ -48,10 +48,37 @@ struct JITAdviceTests {
+             precondition(pairing?.actions == [.pairAgain, .connectLocalDevVPN])
+         }
+ 
+-        // Advice: an error that is not about reaching the device gets no network advice.
+-        for situation in [NetworkSituation.wifi, .cellularOnly] {
+-            precondition(JITNetworkAdvice.advice(forHelperMessage: "Developer Disk Image is not mounted", situation: situation) == nil)
++        // Advice: an error about the device's state gets its own plain explanation, on any network, and never the
++        // cellular advice.
++        let deviceErrors: [(String, JITDeviceProblem, String)] = [
++            ("idevice error: DeveloperModeNotEnabled", .developerModeOff, "Developer Mode"),
++            ("Developer mode is not enabled", .developerModeOff, "Settings"),
++            ("lockdownd: PasswordProtected", .locked, "Unlock"),
++            ("device locked", .locked, "Unlock"),
++            ("PairingDialogResponsePending", .trustPending, "trust"),
++            ("lockdownd error: InvalidHostID", .pairingRejected, "Pair again"),
++            ("UserDeniedPairing", .pairingRejected, "Pair again"),
++            ("Pairing file error: failed to read pairing file", .pairingFileUnreadable, "Pair again"),
++            ("heartbeat timeout", .slept, "screen on"),
++            ("The Developer Disk Image was not mounted after the mount operation completed.", .diskImage, "Reset Developer Disk Image"),
++            ("Developer Disk Image is not mounted", .diskImage, "Check setup"),
++            ("Failed to establish a debugserver connection to the target process.", .debugserver, "Check setup"),
++        ]
++        for (message, problem, phrase) in deviceErrors {
++            precondition(JITDeviceProblem(helperMessage: message) == problem, "\(message) should read as \(problem)")
++            for situation in [NetworkSituation.wifi, .cellularOnly] {
++                let advice = JITNetworkAdvice.advice(forHelperMessage: message, situation: situation)
++                precondition(advice?.message.contains(phrase) == true, "\(message) advice should mention \(phrase)")
++                precondition(advice?.message.contains("Cellular Data") == false)
++                precondition(advice?.message.contains("!") == false)
++            }
+         }
++        precondition(JITNetworkAdvice.advice(forHelperMessage: "InvalidHostID", situation: .wifi)?.actions == [.pairAgain])
++
++        // Advice: an error that is about neither the network nor the device is shown as it came.
++        precondition(JITNetworkAdvice.advice(forHelperMessage: "The JIT script threw an exception", situation: .wifi) == nil)
++        // A timeout is still a connection problem, not a device one.
++        precondition(JITDeviceProblem(helperMessage: "Timed out connecting to 10.7.0.1:49152") == nil)
+ 
+         // Retry: the first connection over cellular is the one iOS misroutes, so try again shortly.
+         guard case .retry(let wait) = JITRetryPolicy.decision(situation: .cellularOnly, problem: .unreachable, attempt: 1) else {

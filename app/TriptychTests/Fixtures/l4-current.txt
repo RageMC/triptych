@@ -1,0 +1,5 @@
+henge: bugcheck regs x19=fffff801e5fbbf40 x20=fffff801e5e57220 x21=1a x22=0 x23=ffffffffc000007b x24=1 x25=fffff801e5e57000 x26=fffff801e5e00690 x27=1 x28=40033960
+[ 47724.84ms][henge-jit] #2: the JIT region came back at 0x7000b04000, above 0x7000000000 where generated code does not run; giving it back. Quit Henge and open it again.
+[henge-jit] prewarm FAILED: 1610612736 bytes
+[ 25923.58ms][prev] [ 38613.83ms][henge-jit] #2: the JIT region came back at 0x7000b80000, above 0x7000000000 where generated code does not run; giving it back. Quit Henge and open it again.
+[ 25923.59ms][prev] [henge-jit] prewarm FAILED: 1610612736 bytes

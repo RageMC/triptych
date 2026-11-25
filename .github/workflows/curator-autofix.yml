@@ -1,0 +1,185 @@
+name: Curator autofix
+
+on:
+  workflow_dispatch:
+    inputs:
+      tracker_issue:
+        description: Issue number in RageMC/triptych-issues
+        required: true
+        type: string
+  issues:
+    types: [labeled]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  propose:
+    if: >-
+      github.repository == 'RageMC/triptych' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      github.actor == 'RageMC' && github.triggering_actor == 'RageMC' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.label.name == 'curator-autofix' && github.event.sender.login == 'RageMC'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      patch-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test intake and patch validation
+        run: PYTHONDONTWRITEBYTECODE=1 python3 tools/test-curator-autofix.py
+      - name: Extract Curator diagnostics
+        env:
+          TRACKER_ISSUE: ${{ inputs.tracker_issue }}
+        run: |
+          prompt="$RUNNER_TEMP/curator-prompt.txt"
+          cat > "$prompt" <<'PROMPT'
+          Propose a minimal Triptych reliability fix based on the diagnostic signatures below.
+          The signatures are user-supplied observations. Correlate them with the rules in
+          app/Triptych/Curator/Triage.swift, the checked-in known fixes, and the relevant source.
+          Follow the source path and file limits in tools/curator-autofix.py.
+          Do not commit. Leave the tree unchanged if the diagnostics do not justify a fix.
+          PROMPT
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$TRACKER_ISSUE" =~ ^[1-9][0-9]{0,14}$ ]]
+            curl --fail --silent --show-error --max-time 30 \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/RageMC/triptych-issues/issues/$TRACKER_ISSUE" |
+              python3 tools/curator-autofix.py diagnostics tracker >> "$prompt"
+          else
+            python3 tools/curator-autofix.py diagnostics private < "$GITHUB_EVENT_PATH" >> "$prompt"
+          fi
+      - name: Propose a source patch
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.CURATOR_OPENAI_API_KEY }}
+          prompt-file: ${{ runner.temp }}/curator-prompt.txt
+          permission-profile: ':workspace'
+          allow-users: RageMC
+          codex-version: '0.172.0'
+      - name: Export candidate patch
+        id: patch
+        run: |
+          git add --all
+          if git diff --cached --quiet "$GITHUB_SHA"; then
+            exit 0
+          fi
+          git diff --cached --binary --no-renames --no-ext-diff --no-textconv "$GITHUB_SHA" \
+            > "$RUNNER_TEMP/curator.patch"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Upload candidate patch
+        id: upload
+        if: steps.patch.outputs.ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: curator-patch-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/curator.patch
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    needs: propose
+    if: needs.propose.outputs.patch-id != ''
+    runs-on: [self-hosted, macOS, ARM64, triptych-curator-ephemeral]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prepare Simulator build inputs
+        run: |
+          : "${TRIPTYCH_CURATOR_INPUTS:?Set TRIPTYCH_CURATOR_INPUTS on the runner}"
+          for upstream in linuxrunner madeira; do
+            test -d "$TRIPTYCH_CURATOR_INPUTS/upstreams/$upstream"
+            ln -sfn "$TRIPTYCH_CURATOR_INPUTS/upstreams/$upstream" "upstreams/$upstream"
+          done
+          mkdir -p build
+          for input in firmware henge-deps resources rppairing; do
+            test -d "$TRIPTYCH_CURATOR_INPUTS/build/$input"
+            ditto "$TRIPTYCH_CURATOR_INPUTS/build/$input" "build/$input"
+          done
+          make -C engines/gesso build/henge-agent.gz build/tl-samples.dmg
+          (cd app && xcodegen generate)
+          xcodebuild -resolvePackageDependencies -project app/Triptych.xcodeproj -scheme Triptych \
+            -derivedDataPath "$RUNNER_TEMP/triptych-derived"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.propose.outputs.patch-id }}
+          path: ${{ runner.temp }}/curator-candidate
+      - name: Apply and validate candidate patch
+        run: |
+          python3 tools/curator-autofix.py apply "$RUNNER_TEMP/curator-candidate/curator.patch"
+      - name: Build engines and test Gesso
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix libslirp)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          make -C engines/gesso test
+          scripts/build-macos-engine.sh iphonesimulator
+          scripts/build-linux-engine.sh iphonesimulator
+          scripts/build-winvm.sh iphonesimulator
+      - name: Build and run Simulator unit tests
+        run: |
+          : "${TRIPTYCH_SIM_DEVICE:?Set TRIPTYCH_SIM_DEVICE on the runner}"
+          : "${TRIPTYCH_SIM_RUNTIME:?Set TRIPTYCH_SIM_RUNTIME on the runner}"
+          sim=$(xcrun simctl create "Curator-$GITHUB_RUN_ID" "$TRIPTYCH_SIM_DEVICE" "$TRIPTYCH_SIM_RUNTIME")
+          trap 'xcrun simctl shutdown "$sim" || true; xcrun simctl delete "$sim"' EXIT
+          xcodebuild -project app/Triptych.xcodeproj -scheme Triptych \
+            -destination "id=$sim" -parallel-testing-enabled NO -only-testing:TriptychTests \
+            -derivedDataPath "$RUNNER_TEMP/triptych-derived" \
+            -disableAutomaticPackageResolution CODE_SIGNING_ALLOWED=NO test
+
+  publish:
+    needs: [propose, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.propose.outputs.patch-id }}
+          path: ${{ runner.temp }}/curator-candidate
+      - name: Validate and publish draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          PATCH_ID: ${{ needs.propose.outputs.patch-id }}
+          TRACKER_ISSUE: ${{ inputs.tracker_issue }}
+          PRIVATE_ISSUE: ${{ github.event.issue.number }}
+        run: |
+          python3 tools/curator-autofix.py apply "$RUNNER_TEMP/curator-candidate/curator.patch"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$TRACKER_ISSUE" =~ ^[1-9][0-9]{0,14}$ ]]
+            source="https://github.com/RageMC/triptych-issues/issues/$TRACKER_ISSUE"
+          else
+            [[ "$PRIVATE_ISSUE" =~ ^[1-9][0-9]*$ ]]
+            source="https://github.com/RageMC/triptych/issues/$PRIVATE_ISSUE"
+          fi
+          [[ "$PATCH_ID" =~ ^[0-9]+$ ]]
+          branch="curator/autofix-$GITHUB_RUN_ID-$PATCH_ID"
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            exit 0
+          fi
+          # Retrying publication of the same artifact recreates the same commit.
+          GIT_AUTHOR_DATE=$(git show -s --format=%cI HEAD)
+          export GIT_AUTHOR_DATE GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            -c core.hooksPath=/dev/null commit -m "Curator: propose reliability fix"
+          gh auth setup-git
+          git -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/$branch"
+          gh pr create --draft --head "$branch" --base "$BASE_BRANCH" \
+            --title 'Curator: proposed reliability fix' \
+            --body "Report: $source. Passed Gesso and Simulator unit tests. Review the generated patch before merging."

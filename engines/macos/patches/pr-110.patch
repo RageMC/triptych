@@ -1,0 +1,56 @@
+diff --git a/host/vm.c b/host/vm.c
+index 04f0cfb1..0bda9e5b 100644
+--- a/host/vm.c
++++ b/host/vm.c
+@@ -272,6 +272,8 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
+     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
+     HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = c->ecid, .seed = c->seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
+     if (c->installer) cfg.run_installer1 = cfg.run_installer2 = 1;
++    /* The chip About This Mac names (31 characters), when the host has a name for it. */
++    if (getenv("HV_SOC_NAME") && *getenv("HV_SOC_NAME")) cfg.soc_name = getenv("HV_SOC_NAME");
+     if (getenv("HV_RUN_INSTALLER")) { /* experiment: "a,b" for the two installer words */
+         unsigned a = 0, b2 = 0;
+         sscanf(getenv("HV_RUN_INSTALLER"), "%u,%u", &a, &b2);
+diff --git a/ios/Henge/Hardware.swift b/ios/Henge/Hardware.swift
+index 5a8da407..a7362791 100644
+--- a/ios/Henge/Hardware.swift
++++ b/ios/Henge/Hardware.swift
+@@ -1,6 +1,7 @@
+ import SwiftUI
+ import UIKit
+ import GameController
++import Metal
+ 
+ /// What this device is, for what the app says and suggests.
+ enum Device {
+@@ -34,6 +35,14 @@ enum Device {
+         return (Int((Double(s.width) / 264 * 25.4).rounded()), Int((Double(s.height) / 264 * 25.4).rounded()))
+     }
+ 
++    /// The chip's name ("Apple A20 Pro"). iOS has no name for the CPU (machdep.cpu.brand_string is empty on an
++    /// iPhone), but Metal names the GPU after the chip: "Apple A20 Pro GPU".
++    static var chipName: String? {
++        guard var name = MTLCreateSystemDefaultDevice()?.name.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
++        if name.hasSuffix(" GPU") { name.removeLast(4) }
++        return name.hasPrefix("Apple ") && name.count > 6 ? name : nil
++    }
++
+     /// How much memory to suggest for a new Mac: what leaves this device room for iOS.
+     static var suggestedRAMGB: Int {
+         let mb = ProcessInfo.processInfo.physicalMemory >> 20
+diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
+index 261cac1e..86498a07 100644
+--- a/ios/Henge/SessionView.swift
++++ b/ios/Henge/SessionView.swift
+@@ -599,6 +599,11 @@ struct SessionView: View {
+         Sharing.prepare()
+         EngineTuning.apply()
+         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
++        // About This Mac's chip: this device's ("Apple A20 Pro"), where it said "Apple M1 (Virtual)". henge-env.txt can name another.
++        if getenv("HV_SOC_NAME") == nil, let chip = Device.chipName {
++            setenv("HV_SOC_NAME", String(chip.prefix(31)), 1)
++            HengeLog.log("session", "chip name for the Mac: \(chip)")
++        }
+         if mac.isRetina {
+             henge_vm_set_display_mm(UInt32(Device.retinaMM.width), UInt32(Device.retinaMM.height))
+         } else {

@@ -1,0 +1,397 @@
+diff --git a/devices/virtio_snd.c b/devices/virtio_snd.c
+index 1349baa8..082cdc6e 100644
+--- a/devices/virtio_snd.c
++++ b/devices/virtio_snd.c
+@@ -55,6 +55,36 @@ static void put32(uint8_t *p, uint32_t v) {
+     memcpy(p, &v, 4);
+ }
+ 
++/* ---- the host's player ---- */
++
++/* Start the host's player for the running stream. If it can't play now, the clock drains the ring
++   and it is tried again later: once a second at first, then less often. */
++static void host_start(HvVirtioSnd *d) {
++    d->host_on = 0;
++    if (!d->backend.start) return;
++    if (d->backend.start(d->backend.opaque, d->channels, d->format, d->rate_hz) == 0) {
++        if (d->host_failures) fprintf(stderr, "hengevm: sound: the host's output plays again (after %u failed starts)\n", d->host_failures);
++        d->host_on = 1;
++        d->host_failures = 0;
++        return;
++    }
++    if (!d->host_failures) fprintf(stderr, "hengevm: sound: the host's output would not start; trying again\n");
++    d->host_failures++;
++    unsigned wait_s = d->host_failures < 4 ? 1 : d->host_failures < 10 ? 4 : 15;
++    d->host_retry_ns = now_ns() + (uint64_t)wait_s * 1000000000ull;
++}
++
++static void host_stop(HvVirtioSnd *d) {
++    if (d->host_on && d->backend.stop) d->backend.stop(d->backend.opaque);
++    d->host_on = 0;
++}
++
++void hv_virtio_snd_kick(HvVirtioSnd *d) {
++    if (!d) return;
++    atomic_store(&d->host_kick, 1);
++    hv_machine_wake(d->vio.m);
++}
++
+ /* ---- control queue ---- */
+ 
+ static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
+@@ -137,8 +167,14 @@ static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
+             d->running = 1;
+             d->clock_start_ns = now_ns();
+             d->clock_start_consumed = atomic_load(&d->consumed);
+-            if (d->backend.start && d->backend.start(d->backend.opaque, d->channels, d->format, d->rate_hz) != 0)
+-                d->backend.start = NULL; /* the host cannot play it: drain by the clock instead */
++            d->host_failures = 0;
++            host_start(d); /* if the host can't play it yet, the clock drains it until it can */
++            static unsigned starts_logged;
++            if (starts_logged < 4) {
++                starts_logged++;
++                fprintf(stderr, "hengevm: sound: the guest plays %u ch, format %u, %u Hz (host output %s)\n", d->channels, d->format,
++                        d->rate_hz, d->host_on ? "on" : "off");
++            }
+         }
+         break;
+     case R_PCM_STOP:
+@@ -146,7 +182,7 @@ static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
+             status = S_BAD_MSG;
+             break;
+         }
+-        if (d->running && d->backend.stop) d->backend.stop(d->backend.opaque);
++        host_stop(d);
+         d->running = 0;
+         break;
+     case R_PCM_RELEASE:
+@@ -154,7 +190,7 @@ static uint32_t control(HvVirtioSnd *d, const HvVirtqElem *e) {
+             status = S_BAD_MSG;
+             break;
+         }
+-        if (d->running && d->backend.stop) d->backend.stop(d->backend.opaque);
++        host_stop(d);
+         d->running = 0;
+         d->prepared = 0;
+         /* Every buffer still held goes back now (the spec requires it). */
+@@ -213,8 +249,18 @@ static void take_tx(HvVirtioSnd *d) {
+ void hv_virtio_snd_poll(HvVirtioSnd *d) {
+     if (!d) return;
+     HvVirtio *v = &d->vio;
+-    /* No backend: the stream plays at its rate by the wall clock. */
+-    if (d->running && !d->backend.start && d->frame_bytes) {
++    if (atomic_exchange(&d->host_kick, 0) && d->running) { /* the host's audio came back: a new player */
++        host_stop(d);
++        if (d->backend.reset) d->backend.reset(d->backend.opaque);
++        d->clock_start_ns = now_ns();
++        d->clock_start_consumed = atomic_load(&d->consumed);
++        d->host_failures = 0;
++        host_start(d);
++    } else if (d->running && !d->host_on && d->backend.start && now_ns() >= d->host_retry_ns) {
++        host_start(d);
++    }
++    /* No host player: the stream plays at its rate by the wall clock. */
++    if (d->running && !d->host_on && d->frame_bytes) {
+         uint64_t now = now_ns();
+         uint64_t target = d->clock_start_consumed +
+                           (now - d->clock_start_ns) * d->rate_hz / 1000000000ull * d->frame_bytes;
+@@ -315,6 +361,7 @@ void hv_virtio_snd_resume(HvVirtioSnd *d) {
+     if (!d) return;
+     d->clock_start_ns = now_ns();
+     d->clock_start_consumed = atomic_load(&d->consumed);
+-    if (d->running && d->backend.start && d->backend.start(d->backend.opaque, d->channels, d->format, d->rate_hz) != 0)
+-        d->backend.start = NULL;
++    d->host_on = 0;
++    d->host_failures = 0;
++    if (d->running) host_start(d);
+ }
+diff --git a/devices/virtio_snd.h b/devices/virtio_snd.h
+index b6592732..438f9a89 100644
+--- a/devices/virtio_snd.h
++++ b/devices/virtio_snd.h
+@@ -29,6 +29,9 @@ typedef struct HvVirtioSndBackend {
+     /* Called on the CPU thread. Return 0 if the host can play this. */
+     int (*start)(void *opaque, unsigned channels, unsigned format, unsigned rate_hz);
+     void (*stop)(void *opaque);
++    /* Optional, CPU thread: throw the host's player away, so the next start builds a new one
++       (after an interruption or a media services reset, the old one may never play again). */
++    void (*reset)(void *opaque);
+     void *opaque;
+ } HvVirtioSndBackend;
+ 
+@@ -48,12 +51,22 @@ typedef struct HvVirtioSnd {
+     uint64_t pending_end[HV_VSND_PENDING]; /* `written` after this buffer's data */
+     uint32_t phead, pcopy, ptail; /* pcopy: next one whose audio is not yet in the ring */
+     uint64_t underruns, xfers;
++    /* The host's player for a running stream: playing, or failed and to be tried again at
++       host_retry_ns (the clock drains the ring meanwhile). A failure is not for good: iOS refuses
++       to start audio during a call or before the app's session is active, and plays again after. */
++    int host_on;
++    uint32_t host_failures;
++    uint64_t host_retry_ns;
++    _Atomic int host_kick; /* any thread: start the host's player again from scratch */
+ } HvVirtioSnd;
+ 
+ HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus);
+ /* CPU thread, each tick: return played buffers to the guest. */
+ void hv_virtio_snd_poll(HvVirtioSnd *d);
+ void hv_virtio_snd_resume(HvVirtioSnd *d);
++/* Any thread: the host's audio came back (an interruption ended, the route changed, media services
++   were reset): the CPU thread rebuilds the host's player for a running stream at its next poll. */
++void hv_virtio_snd_kick(HvVirtioSnd *d);
+ /* Backend thread: take up to `len` bytes of PCM; the rest of `buf` is silence. Returns bytes taken. */
+ uint32_t hv_virtio_snd_pull(HvVirtioSnd *d, void *buf, uint32_t len);
+ 
+diff --git a/host/audio_mac.c b/host/audio_mac.c
+index 14fd3f09..ca64876d 100644
+--- a/host/audio_mac.c
++++ b/host/audio_mac.c
+@@ -17,6 +17,19 @@
+ static AudioComponentInstance unit;
+ static int unit_running;
+ static unsigned cur_channels, cur_format, cur_rate;
++static unsigned reports;
++
++/* What went wrong, by its OSStatus (often four characters), for the first few failures. */
++static void report(const char *what, OSStatus st) {
++    if (reports >= 12) return;
++    reports++;
++    uint32_t u = (uint32_t)st;
++    char cc[5] = {(char)(u >> 24), (char)(u >> 16), (char)(u >> 8), (char)u, 0};
++    int printable = 1;
++    for (int i = 0; i < 4; i++) printable &= cc[i] >= 32 && cc[i] < 127;
++    if (printable) fprintf(stderr, "hengevm: sound: %s failed: '%s' (%d)\n", what, cc, (int)st);
++    else fprintf(stderr, "hengevm: sound: %s failed: %d\n", what, (int)st);
++}
+ 
+ static OSStatus render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
+                        UInt32 frames, AudioBufferList *io) {
+@@ -40,7 +53,12 @@ static int start(void *opaque, unsigned channels, unsigned format, unsigned rate
+         AudioComponentDescription desc = {kAudioUnitType_Output, HV_OUTPUT_UNIT,
+                                           kAudioUnitManufacturer_Apple, 0, 0};
+         AudioComponent comp = AudioComponentFindNext(NULL, &desc);
+-        if (!comp || AudioComponentInstanceNew(comp, &unit) != noErr) return -1;
++        OSStatus made = comp ? AudioComponentInstanceNew(comp, &unit) : -1;
++        if (made != noErr) {
++            unit = NULL;
++            report("no output unit", made);
++            return -1;
++        }
+         unsigned bytes = format == HV_VSND_FMT_S16 ? 2 : 4;
+         AudioStreamBasicDescription f = {0};
+         f.mSampleRate = rate_hz;
+@@ -52,17 +70,23 @@ static int start(void *opaque, unsigned channels, unsigned format, unsigned rate
+         f.mChannelsPerFrame = channels;
+         f.mBitsPerChannel = bytes * 8;
+         AURenderCallbackStruct cb = {render, d};
+-        if (AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f) != noErr ||
+-            AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb) != noErr ||
+-            AudioUnitInitialize(unit) != noErr) {
++        OSStatus st = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
++        if (st == noErr) st = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
++        if (st == noErr) st = AudioUnitInitialize(unit);
++        if (st != noErr) {
+             fprintf(stderr, "hengevm: sound: the output device refused %u ch, format %u, %u Hz\n", channels, format, rate_hz);
++            report("initialize", st);
+             AudioComponentInstanceDispose(unit);
+             unit = NULL;
+             return -1;
+         }
+         cur_channels = channels, cur_format = format, cur_rate = rate_hz;
+     }
+-    if (!unit_running && AudioOutputUnitStart(unit) == noErr) unit_running = 1;
++    if (!unit_running) {
++        OSStatus st = AudioOutputUnitStart(unit);
++        if (st == noErr) unit_running = 1;
++        else report("start", st); /* iOS: '!pla' during a call, or with the app's audio session inactive */
++    }
+     return unit_running ? 0 : -1;
+ }
+ 
+@@ -72,8 +96,14 @@ static void stop(void *opaque) {
+     unit_running = 0;
+ }
+ 
++/* Throw the unit away: the next start makes a new one for whatever output is current. */
++static void reset_unit(void *opaque) {
++    (void)opaque;
++    hv_audio_detach();
++}
++
+ void hv_audio_attach(HvVirtioSnd *d) {
+-    d->backend = (HvVirtioSndBackend){start, stop, d};
++    d->backend = (HvVirtioSndBackend){start, stop, reset_unit, d};
+ }
+ 
+ void hv_audio_detach(void) {
+diff --git a/host/vm.c b/host/vm.c
+index 04f0cfb1..ba586d1f 100644
+--- a/host/vm.c
++++ b/host/vm.c
+@@ -728,6 +728,10 @@ static void wheel(uint16_t axis, int amount) {
+ void hv_vm_mouse_wheel(int dy) { wheel(HV_REL_WHEEL, dy); }
+ void hv_vm_mouse_hwheel(int dx) { wheel(HV_REL_HWHEEL, dx); }
+ 
++void hv_vm_audio_kick(void) {
++    if (sound_on) hv_virtio_snd_kick(board.snd);
++}
++
+ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
+     if (x < 0) x = 0;
+     if (x > HV_TP_SENSOR_X) x = HV_TP_SENSOR_X;
+diff --git a/host/vm.h b/host/vm.h
+index f3f53720..daa4a8ca 100644
+--- a/host/vm.h
++++ b/host/vm.h
+@@ -94,6 +94,9 @@ void hv_vm_mouse_move(int dx, int dy);
+ void hv_vm_mouse_button(int button, int down); /* 0 left, 1 right, 2 middle */
+ void hv_vm_mouse_wheel(int dy);
+ void hv_vm_mouse_hwheel(int dx);
++/* Any thread: the host's audio came back (an interruption ended, the output changed); a playing
++   stream gets a new host player. */
++void hv_vm_audio_kick(void);
+ /* The Magic Trackpad 2 on the USB bus: a finger on it. phase: 0 down, 1 move, 2 up; id a
+    stable 1..15 per touch; x, y in sensor units (HV_TP_SENSOR_* in devices/xhci.h).
+    ts_ms is the touch sample's own clock in ms (see hv_xhci_touch). */
+diff --git a/ios/Henge/HengeAppDelegate.swift b/ios/Henge/HengeAppDelegate.swift
+index 11bc6f85..66b7985c 100644
+--- a/ios/Henge/HengeAppDelegate.swift
++++ b/ios/Henge/HengeAppDelegate.swift
+@@ -2,6 +2,11 @@ import UIKit
+ 
+ /// The app's UIKit delegate, for what SwiftUI's App cannot express.
+ final class HengeAppDelegate: NSObject, UIApplicationDelegate {
++    func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
++        HengeAudio.shared.start()
++        return true
++    }
++
+     /// Before iOS 27 the external display scene connects through Info.plist's
+     /// UIWindowSceneSessionRoleExternalDisplayNonInteractive entry (ExternalDisplaySceneDelegate).
+     /// With the SwiftUI lifecycle UIKit asks here for the application role only, never for that
+diff --git a/ios/Henge/HengeAudio.swift b/ios/Henge/HengeAudio.swift
+new file mode 100644
+index 00000000..2c77b5ff
+--- /dev/null
++++ b/ios/Henge/HengeAudio.swift
+@@ -0,0 +1,78 @@
++import AVFAudio
++import UIKit
++
++/// The Mac's sound on this device: the audio session it plays through, and what brings it back.
++///
++/// The engine plays the Mac's sound through RemoteIO (host/audio_mac.c). A phone call, Siri or an alarm
++/// interrupts that unit and iOS doesn't start it again; when iOS resets its media services the unit is
++/// gone for good. Either way the Mac's sound stayed silent until Henge was relaunched. Here the session is
++/// made active again and the engine is told to build a new player (henge_vm_audio_kick). The output
++/// (speaker, AirPods, the display's HDMI audio) is logged as it changes, so a device log says where the
++/// sound went.
++final class HengeAudio {
++    static let shared = HengeAudio()
++    private var observers: [NSObjectProtocol] = []
++
++    /// At launch, once.
++    func start() {
++        guard observers.isEmpty else { return }
++        let center = NotificationCenter.default
++        let session = AVAudioSession.sharedInstance()
++        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: session, queue: .main) { [weak self] note in
++            self?.interrupted(note)
++        })
++        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: session, queue: .main) { [weak self] _ in
++            HengeLog.log("audio", "media services were reset")
++            self?.comeBack()
++        })
++        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: session, queue: .main) { [weak self] note in
++            self?.routeChanged(note)
++        })
++    }
++
++    /// A Mac is starting: its sound needs the session active (RemoteIO won't start in an inactive one).
++    func activate() {
++        let session = AVAudioSession.sharedInstance()
++        do {
++            try session.setCategory(.playback, options: [.mixWithOthers])
++            try session.setActive(true)
++            HengeLog.log("audio", "session active, output \(Self.describe(session.currentRoute)), \(Int(session.sampleRate)) Hz")
++        } catch {
++            HengeLog.log("audio", "session not active: \(error.localizedDescription)")
++        }
++    }
++
++    private func interrupted(_ note: Notification) {
++        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
++              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
++        switch type {
++        case .began:
++            HengeLog.log("audio", "interrupted")
++        case .ended:
++            HengeLog.log("audio", "interruption ended")
++            comeBack()
++        @unknown default:
++            break
++        }
++    }
++
++    private func routeChanged(_ note: Notification) {
++        guard let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
++              let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
++        let route = AVAudioSession.sharedInstance().currentRoute
++        HengeLog.log("audio", "output now \(Self.describe(route)) (reason \(raw))")
++        // A new output, or the old one gone: a fresh player is made for whatever is current. RemoteIO
++        // usually follows on its own; this covers the times it stops instead (a display's audio going away).
++        if reason == .newDeviceAvailable || reason == .oldDeviceUnavailable { henge_vm_audio_kick() }
++    }
++
++    private func comeBack() {
++        activate()
++        henge_vm_audio_kick()
++    }
++
++    private static func describe(_ route: AVAudioSessionRouteDescription) -> String {
++        let outputs = route.outputs.map { "\($0.portName) (\($0.portType.rawValue))" }
++        return outputs.isEmpty ? "none" : outputs.joined(separator: ", ")
++    }
++}
+diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
+index 344d8a15..7875ef48 100644
+--- a/ios/Henge/Native/henge-vm.c
++++ b/ios/Henge/Native/henge-vm.c
+@@ -399,6 +399,11 @@ void henge_vm_mouse_scroll(int dx, int dy) {
+     if (dx) hv_vm_mouse_hwheel(dx);
+     pthread_rwlock_unlock(&api_lock);
+ }
++void henge_vm_audio_kick(void) {
++    if (!lock_running()) return;
++    hv_vm_audio_kick();
++    pthread_rwlock_unlock(&api_lock);
++}
+ int henge_vm_pointer(int *x, int *y) {
+     if (!lock_running()) return -1;
+     int result = hv_vm_pointer(x, y);
+diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
+index 4b92cae4..ceb809e5 100644
+--- a/ios/Henge/Native/henge-vm.h
++++ b/ios/Henge/Native/henge-vm.h
+@@ -86,6 +86,9 @@ void henge_vm_mouse_move(int dx, int dy);
+ void henge_vm_mouse_button(int button, int down);
+ /* Wheel units: dy > 0 up, dx > 0 right. */
+ void henge_vm_mouse_scroll(int dx, int dy);
++/* The device's audio came back (an interruption ended, media services were reset, the output
++   changed): a sound the Mac is playing gets a new player. */
++void henge_vm_audio_kick(void);
+ /* The Magic Trackpad 2 the Mac sees on its USB bus: a finger on it. phase: 0 down, 1 move, 2 up;
+    finger a stable 1..15 per touch; x, y sensor units 0..8134, 0..5206. ts_ms is the touch
+    sample's own clock in ms, so the guest computes finger speed from real sample timing. */
+diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
+index 261cac1e..b21ca101 100644
+--- a/ios/Henge/SessionView.swift
++++ b/ios/Henge/SessionView.swift
+@@ -195,6 +195,7 @@ struct SessionView: View {
+         }
+         .onAppear {
+             UIApplication.shared.isIdleTimerDisabled = true
++            HengeAudio.shared.activate()
+             HardwareMouse.shared.start()
+             VolumeClicks.shared.start()
+         }

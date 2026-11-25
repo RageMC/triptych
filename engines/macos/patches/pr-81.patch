@@ -1,0 +1,27 @@
+diff --git a/ios/Henge/EngineTuning.swift b/ios/Henge/EngineTuning.swift
+index f1c1303c..e7e3466b 100644
+--- a/ios/Henge/EngineTuning.swift
++++ b/ios/Henge/EngineTuning.swift
+@@ -22,7 +22,8 @@ enum EngineTuning {
+         var env = defaults
+         let d = UserDefaults.standard
+         if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
+-        if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
++        // Superblocks default ON (ship posture): only an explicit stored off turns it off.
++        if d.object(forKey: superblocksKey) == nil || d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
+         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
+         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }
+         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
+index 3f23a0ba..9352c7c7 100644
+--- a/ios/Henge/SettingsView.swift
++++ b/ios/Henge/SettingsView.swift
+@@ -13,7 +13,7 @@ struct SettingsView: View {
+     @AppStorage(EngineTuning.refreshKey) private var refreshRate = 60
+     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
+     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
+-    @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
++    @AppStorage(EngineTuning.superblocksKey) private var superblocks = true
+     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
+ 
+     /// The second footer paragraph: how you click, given the selected input mode.

@@ -1,0 +1,54 @@
+name: Compatibility Report
+description: Report how a specific guest OS, Mac app, or Windows game runs in Triptych
+title: "[Compat]: "
+labels: ["compatibility"]
+body:
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      options:
+        - "Pane (Windows app / game)"
+        - "Casement (Windows 11 ARM64 PC)"
+        - "Atelier · Mac apps (UIKit-backed AppKit / Gesso TL)"
+        - "Atelier · macOS VM"
+        - "Fresco (Linux distro / desktop)"
+        - "x86 PC (QEMU x86_64)"
+    validations:
+      required: true
+
+  - type: input
+    id: target
+    attributes:
+      label: Guest OS / Application / Game Name & Version
+      placeholder: "Ubuntu 26.04 Xfce / CrossOver Preview 27.0 / Sample App 1.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: status
+    attributes:
+      label: Compatibility Status
+      options:
+        - "Playable / Working (boots and runs smoothly)"
+        - "In-Game / UI Reached (minor rendering, input, or audio issues)"
+        - "Menu / Installer Reached (crashes or hangs after launch)"
+        - "Does Not Boot / Immediate Crash"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Device, iPadOS Version & JIT Source
+      placeholder: "iPad16,6 · iPadOS 27.2 · LiveContainer + StikDebug"
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Observations & Scrubbed Logs
+      description: Describe behavior, performance, and any Curator diagnostic findings. Do not include proprietary files, keys, or personal paths.
+    validations:
+      required: true

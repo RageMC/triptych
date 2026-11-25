@@ -1,0 +1,30 @@
+From 9c187d5b4303f2f78ab1d79b880da29f63fd64cc Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:50:23 -0500
+Subject: [PATCH] memop: LDAPUR/STLUR are alignment-checked like LDAR
+
+Without the flag the JIT emitted them with only a page check: a misaligned one
+crossing 16 bytes faulted on the host (SIGBUS) and killed the VM. Windows'
+x64 emulator issues such loads at EL0 (stage 2 of Setup). Now the helper does
+them, under SCTLR_EL1.nAA and FEAT_LSE2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/memop.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/core/memop.c b/core/memop.c
+index be85b03..cb4e97d 100644
+--- a/core/memop.c
++++ b/core/memop.c
+@@ -155,6 +155,7 @@ int hv_mem_decode(uint32_t insn, HvMemOp *op) {
+         uint32_t opc = (insn >> 22) & 3;
+         op->kind = HV_MEM_ORDERED;
+         op->mode = HV_ADDR_OFFSET;
++        op->align = 1; /* as LDAR: a misaligned one is the helper's (SCTLR_EL1.nAA, FEAT_LSE2); the host would fault across 16 bytes */
+         op->imm = sext((insn >> 12) & 0x1ff, 9);
+         op->size = size;
+         op->rm = 31;
+-- 
+2.46.2
+

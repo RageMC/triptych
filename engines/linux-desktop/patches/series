@@ -1,0 +1,5 @@
+0001-fakefs-case-insensitive-host.patch
+0002-fakefs-import-case-aliases-and-filters.patch
+triptych-private-console.patch
+triptych-console-non-tty.patch
+triptych-console-size.patch

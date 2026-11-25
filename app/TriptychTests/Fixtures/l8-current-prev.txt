@@ -1,0 +1,2 @@
+[   7103.67ms][linux] start failed: tp_linux_start returned -1 (root ubuntu)
+[    19.03ms][prev] 2026-11-22 01:49:46.006 Triptych[19032:6033977] MacAppsKit: dlopen guest: dlopen(<app-path>, 0x0002): tried: '<app-path>' (code signature invalid in <uuid> '<app-path>' (errno=1) sliceOffset=0x00000000, codeBlobOffset=0x0022BAF0, codeBlobSize=0x00004600), '/private/preboot/Cryptexes/OS<app-path>' (no such file), '<app-path>' (code signature invalid in <uuid> '<app-path>' (errno=1) sliceOffset=0x00

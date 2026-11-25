@@ -1,0 +1,182 @@
+name: MacAppHost
+options:
+  bundleIdPrefix: app.triptych
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    ARCHS: arm64
+    SWIFT_VERSION: "5.0"
+    ENABLE_BITCODE: NO
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+targets:
+  MacAppHost:
+    type: application
+    platform: iOS
+    sources:
+      - path: MacAppHost
+        excludes:
+          - Info.plist
+          - MacAppHost.entitlements
+    entitlements:
+      path: MacAppHost/MacAppHost.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.MacAppHost
+        INFOPLIST_FILE: MacAppHost/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_DEBUG_DYLIB: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/Frameworks"]
+    postBuildScripts:
+      - name: Build and Embed Retagged TestMacApp and libShim_AppKit
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          HOST_ROOT="$SRCROOT"
+          STAGE="$TARGET_TEMP_DIR/macapps-stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/MacTest.app/Contents/MacOS" "$STAGE/MacTest.app/Contents/Resources"
+
+          # 1. Build retag for the Mac host (strip iOS build env vars first).
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk macosx clang -Wall -Wextra -O2 \
+            "$HOST_ROOT/retag/retag.c" -o "$STAGE/retag"
+
+          # 2. Build TestMacApp strictly against macOS arm64 SDK.
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk macosx clang -fobjc-arc -arch arm64 -mmacosx-version-min=14.0 \
+            -framework AppKit -framework Metal -framework QuartzCore -framework Foundation \
+            "$HOST_ROOT/testapp/main.m" -o "$STAGE/MacTest.app/Contents/MacOS/TestMacApp"
+
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk macosx metal \
+            "$HOST_ROOT/testapp/triangle.metal" -o "$STAGE/MacTest.app/Contents/Resources/testapp.metallib"
+
+          # 3. Build libShim_AppKit.dylib for the active iOS platform (simulator or device).
+          if [ "$PLATFORM_NAME" = "iphonesimulator" ]; then
+            SHIM_SDK="iphonesimulator"
+            SHIM_TARGET="arm64-apple-ios17.0-simulator"
+            RETAG_PLATFORM="iossim"
+          else
+            SHIM_SDK="iphoneos"
+            SHIM_TARGET="arm64-apple-ios17.0"
+            RETAG_PLATFORM="ios"
+          fi
+
+          APP_DIR="$TARGET_BUILD_DIR/$WRAPPER_NAME"
+          FW_DIR="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
+          GUEST_DIR="$APP_DIR/MacGuest"
+          mkdir -p "$FW_DIR" "$GUEST_DIR/Contents/MacOS" "$GUEST_DIR/Contents/Resources"
+
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk "$SHIM_SDK" clang -Wall -Wextra -fobjc-arc \
+            -target "$SHIM_TARGET" -dynamiclib \
+            -install_name @rpath/libShim_AppKit.dylib \
+            -Wl,-reexport_framework,UIKit \
+            -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Metal \
+            "$HOST_ROOT/shim/libShim_AppKit.m" "$HOST_ROOT/shim/libShim_Nib.m" -o "$FW_DIR/libShim_AppKit.dylib"
+
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk "$SHIM_SDK" clang -Wall -Wextra -fobjc-arc \
+            -target "$SHIM_TARGET" -dynamiclib \
+            -install_name @rpath/libShim_MacShims.dylib \
+            -Wl,-reexport_framework,CoreFoundation \
+            -Wl,-reexport_framework,Foundation \
+            -Wl,-reexport_framework,CoreGraphics \
+            -Wl,-reexport_framework,CoreServices \
+            -Wl,-reexport_framework,Security \
+            -Wl,-reexport_framework,SystemConfiguration \
+            -Wl,-reexport_framework,IOKit \
+            -framework UIKit \
+            "$HOST_ROOT/shim/libShim_MacShims.m" -o "$FW_DIR/libShim_MacShims.dylib"
+
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk "$SHIM_SDK" swiftc -c \
+            -target "$SHIM_TARGET" \
+            -module-name ShimSUI \
+            -parse-as-library \
+            -enable-library-evolution \
+            -import-objc-header "$HOST_ROOT/shim/libShim_SwiftUI_Bridge.h" \
+            "$HOST_ROOT/shim/libShim_SwiftUI.swift" \
+            -o "$STAGE/libShim_SwiftUI.o"
+          /usr/bin/python3 "$HOST_ROOT/shim/gen_swiftui_aliases.py" \
+            "$STAGE/libShim_SwiftUI.o" "$STAGE/swiftui_aliases.txt"
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk "$SHIM_SDK" swiftc \
+            -target "$SHIM_TARGET" \
+            -emit-library \
+            -o "$FW_DIR/libShim_SwiftUI.dylib" \
+            "$STAGE/libShim_SwiftUI.o" \
+            "$FW_DIR/libShim_AppKit.dylib" \
+            -framework SwiftUI -framework UIKit -framework Foundation \
+            -Xlinker -install_name -Xlinker @rpath/libShim_SwiftUI.dylib \
+            -Xlinker -reexport_framework -Xlinker SwiftUI \
+            -Xlinker -alias_list -Xlinker "$STAGE/swiftui_aliases.txt"
+
+          SHIM_SDK_PATH="$(/usr/bin/xcrun --sdk "$SHIM_SDK" --show-sdk-path)"
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk "$SHIM_SDK" clang -Wall -Wextra \
+            -target "$SHIM_TARGET" -dynamiclib \
+            -install_name @rpath/libShim_swiftCore.dylib \
+            -L"$SHIM_SDK_PATH/usr/lib/swift" -Wl,-reexport-lswiftCore \
+            "$HOST_ROOT/shim/libShim_swiftCore.c" -o "$FW_DIR/libShim_swiftCore.dylib"
+
+          # Thin 1-to-1 re-export shims so Mach-O library ordinals never shift when retagging.
+          printf 'void _shim_reexport_anchor(void) {}\n' > "$STAGE/reexport.c"
+          env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+            /usr/bin/xcrun -sdk "$SHIM_SDK" clang -target "$SHIM_TARGET" -dynamiclib \
+            -install_name @rpath/libShim_Cocoa.dylib \
+            -Wl,-reexport_library,"$FW_DIR/libShim_AppKit.dylib" \
+            "$STAGE/reexport.c" -o "$FW_DIR/libShim_Cocoa.dylib"
+          for SHIM_FW in CoreFoundation Foundation CoreGraphics CoreServices Security SecurityFoundation DiskArbitration ServiceManagement SystemConfiguration IOKit; do
+            env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \
+              /usr/bin/xcrun -sdk "$SHIM_SDK" clang -target "$SHIM_TARGET" -dynamiclib \
+              -install_name "@rpath/libShim_${SHIM_FW}.dylib" \
+              -Wl,-reexport_library,"$FW_DIR/libShim_MacShims.dylib" \
+              "$STAGE/reexport.c" -o "$FW_DIR/libShim_${SHIM_FW}.dylib"
+          done
+
+          # 4. Retag TestMacApp to target iOS/Simulator, shrink __PAGEZERO, convert MH_EXECUTE -> MH_DYLIB,
+          #    rewrite AppKit -> @rpath/libShim_AppKit.dylib, and ad-hoc sign.
+          "$STAGE/retag" \
+            --platform "$RETAG_PLATFORM" \
+            --minos 17.0 \
+            --sdk 27.2 \
+            --rewrite-deps \
+            --add-rpath @executable_path/Frameworks \
+            --no-sign \
+            "$STAGE/MacTest.app/Contents/MacOS/TestMacApp" \
+            -o "$GUEST_DIR/Contents/MacOS/TestMacApp"
+
+          cp "$STAGE/MacTest.app/Contents/Resources/testapp.metallib" "$GUEST_DIR/Contents/Resources/testapp.metallib"
+
+          SIGN_ID="${EXPANDED_CODE_SIGN_IDENTITY:-}"
+          if [ -z "$SIGN_ID" ] || [ "${CODE_SIGNING_ALLOWED:-NO}" = "NO" ]; then
+            SIGN_ID="-"
+          fi
+          for DYLIB in "$FW_DIR"/libShim_*.dylib; do
+            /usr/bin/codesign --force --sign "$SIGN_ID" --timestamp=none "$DYLIB"
+          done
+          /usr/bin/codesign --force --sign "$SIGN_ID" --timestamp=none "$GUEST_DIR/Contents/MacOS/TestMacApp"
+  MacAppHostUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: MacAppHostUITests
+    dependencies:
+      - target: MacAppHost
+    settings:
+      base:
+        TEST_TARGET_NAME: MacAppHost
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.MacAppHostUITests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  MacAppHost:
+    build:
+      targets:
+        MacAppHost: all
+        MacAppHostUITests: [test]
+    test:
+      targets: [MacAppHostUITests]

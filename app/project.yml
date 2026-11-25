@@ -1,0 +1,402 @@
+name: Triptych
+options:
+  bundleIdPrefix: app.triptych
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    ARCHS: arm64
+    ENABLE_BITCODE: NO
+    # Keep the builder's home folder out of the binaries (scripts/lib/no-home-paths.sh does the same for engines):
+    # __FILE__, assert and debug-info paths become "~/...", and Swift's #file becomes "Module/File.swift".
+    OTHER_CFLAGS: ["$(inherited)", "-ffile-prefix-map=$(HOME)=~", "-fdebug-prefix-map=$(HOME)=~"]
+    OTHER_SWIFT_FLAGS: ["$(inherited)", "-file-prefix-map", "$(HOME)=~", "-debug-prefix-map", "$(HOME)=~",
+                        "-enable-upcoming-feature", "ConciseMagicFile"]
+  configs:
+    Release:
+      # Drop the debug map (object-file paths) from shipped binaries; symbols stay, the dSYM keeps the debug info.
+      DEPLOYMENT_POSTPROCESSING: YES
+      STRIP_INSTALLED_PRODUCT: YES
+      STRIP_STYLE: debugging
+targets:
+  Triptych:
+    type: application
+    platform: iOS
+    sources:
+      - path: Triptych
+      - path: ../build/resources/alpine-fs
+        type: folder
+        buildPhase: resources
+      - path: ../build/resources/triptych-jit.js
+        buildPhase: resources
+      # Shown on the About screen (AboutView.swift).
+      - path: ../CREDITS.md
+        buildPhase: resources
+      - path: ../upstreams/llama.cpp/LICENSE
+        buildPhase: resources
+      # Linux desktop input agent (XTest over 127.0.0.1:5950), written into the guest by LinuxDesktop.swift.
+      - path: ../engines/linux-desktop/proto/guest_input_agent.py
+        buildPhase: resources
+      # winarm's UEFI firmware (EDK2, BSD-2-Clause-Patent; scripts/build-edk2.sh) and its licence.
+      - path: ../build/firmware/QEMU_EFI.fd
+        buildPhase: resources
+      - path: ../build/firmware/QEMU_VARS.fd
+        buildPhase: resources
+      - path: ../build/firmware/License.txt
+        buildPhase: resources
+      # EDK2 per-file licence texts shipped with the x86pc OVMF firmware.
+      - path: ../licenses/edk2-licenses.txt
+        buildPhase: resources
+      # Gesso (derived from Henge, GPL-2.0-or-later; JIT parts from Husk).
+      - path: ../engines/gesso/ios/Henge/Native/henge-vm.c
+      - path: ../engines/gesso/ios/Henge/Native/henge-ios-jit.c
+      - path: ../engines/gesso/ios/Henge/Native/henge-brk.S
+      # henge-tl.c / henge-tl-app.m and libhengetl are the HengeTL framework (loaded on first use, see HengeTLLazy.c).
+      # Gesso supplies the Mac VM session UI and JIT plumbing (GPL-2.0-or-later). Triptych supplies the app entry point and setup screens.
+      - path: ../engines/gesso/ios/Henge
+        includes: ["*.swift", "JIT/*.swift"]
+      - path: ../engines/gesso/ios/HengeJITHelper/HengeJITMessages.swift
+      # Licence texts (StikJIT, idevice, rppairing crates); henge-jit.js is deliberately not bundled, see JITScriptAlias.swift.
+      - path: ../engines/gesso/ios/Henge/Resources/legal
+        type: folder
+        buildPhase: resources
+      - path: ../engines/gesso/build/henge-agent.gz
+        buildPhase: resources
+      - path: ../engines/gesso/build/tl-samples.dmg
+        buildPhase: resources
+      - path: ../engines/gesso/build/tl-samples/Hello (C)
+        buildPhase: resources
+    dependencies:
+      - target: TriptychJITHelper
+        embed: true
+      - target: SwiftTerm
+        embed: true
+      - target: MacAppsKit
+        embed: true
+      # Embedded, not linked: Triptych dlopens it (Triptych/Henge/HengeTLLazy.c).
+      - target: HengeTL
+        embed: true
+        link: false
+    postBuildScripts:
+      - name: Embed Mac-app shims
+        # build/macapps/<sdk> from scripts/build-macapps.sh (run by MacAppsKit's pre-build step). The retagged guest's
+        # load commands name these dylibs by @rpath, so they sit in Frameworks/; MacAppsKit dlopens them at launch
+        # (they are never linked into Triptych itself).
+        script: |
+          set -e
+          M="$SRCROOT/../build/macapps/$PLATFORM_NAME"
+          FWD="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"; mkdir -p "$FWD"
+          cp "$M"/Frameworks/libShim_*.dylib "$FWD/"
+          cp "$M/seed/TestMacApp.zip" "$M/seed/MacBuiltApp.zip" "$TARGET_BUILD_DIR/$WRAPPER_NAME/"
+          SIGN="${EXPANDED_CODE_SIGN_IDENTITY:--}"; [ "${CODE_SIGNING_ALLOWED:-NO}" = NO ] && SIGN=-
+          for f in "$FWD"/libShim_*.dylib; do codesign --force --sign "$SIGN" --timestamp=none "$f"; done
+        basedOnDependencyAnalysis: false
+      - name: Embed Perl library
+        # Perl's pure-Perl library (scripts/build-perl-ios.sh) and Triptych::Process, for PerlCommand.c.
+        script: |
+          set -e
+          D="$TARGET_BUILD_DIR/$WRAPPER_NAME/perl-lib"; mkdir -p "$D"
+          rsync -a --delete --exclude Triptych/ "$SRCROOT/../build/perl/lib/" "$D/"
+          rsync -a "$SRCROOT/../engines/macapps/perl/Triptych" "$D/"
+        basedOnDependencyAnalysis: false
+      - name: Embed StikJIT
+        # The helper links StikJIT; as in Henge it lives in the app's Frameworks (device only: the xcframework has no
+        # Simulator slice, and the Simulator build uses a stub helper).
+        script: |
+          set -e
+          if [ "$PLATFORM_NAME" != "iphoneos" ]; then exit 0; fi
+          SRC="$SRCROOT/../upstreams/madeira/app/Frameworks/StikJIT.xcframework/ios-arm64/StikJIT.framework"
+          DST="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/StikJIT.framework"
+          rm -rf "$DST"; mkdir -p "$(dirname "$DST")"; ditto "$SRC" "$DST"
+          rm -rf "$DST/Headers" "$DST/Modules"
+          PLIST="$DST/Info.plist"
+          if [ ! -f "$PLIST" ]; then
+            plutil -create xml1 "$PLIST"
+            plutil -insert CFBundleIdentifier -string "$PRODUCT_BUNDLE_IDENTIFIER.StikJIT" "$PLIST"
+            plutil -insert CFBundleExecutable -string StikJIT "$PLIST"
+            plutil -insert CFBundleName -string StikJIT "$PLIST"
+            plutil -insert CFBundlePackageType -string FMWK "$PLIST"
+            plutil -insert CFBundleInfoDictionaryVersion -string 6.0 "$PLIST"
+            plutil -insert CFBundleShortVersionString -string 1.9.0 "$PLIST"
+            plutil -insert CFBundleVersion -string 1.9.0 "$PLIST"
+            plutil -insert MinimumOSVersion -string 17.4 "$PLIST"
+            plutil -insert CFBundleSupportedPlatforms -array "$PLIST"
+            plutil -insert CFBundleSupportedPlatforms.0 -string iPhoneOS "$PLIST"
+          fi
+          if [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ] && [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then
+            codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none "$DST"
+          fi
+        basedOnDependencyAnalysis: false
+      - name: Embed x86pc engine
+        # build/x86pc from scripts/build-x86pc.sh. X86PCVM dlopens the QEMU frameworks: the JIT build (ios, or the
+        # Simulator's ios_simulator) and the TCTI build (ios-tci, devices without JIT); qemu-img.framework creates qcow2
+        # disks. The firmware and pc-bios subset go to x86pc-fw/ in the app root. Missing output is a warning, not an error.
+        script: |
+          set -e
+          X="$SRCROOT/../build/x86pc"
+          if [ ! -d "$X/fw" ]; then echo "warning: x86pc engine not built (scripts/build-x86pc.sh)"; exit 0; fi
+          APPDIR="$TARGET_BUILD_DIR/$WRAPPER_NAME"
+          FWD="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"; mkdir -p "$FWD" "$APPDIR/x86pc-fw"
+          if [ "$PLATFORM_NAME" = iphonesimulator ]; then SRCS="$X/ios_simulator/frameworks"; else SRCS="$X/ios/frameworks $X/ios-tci/frameworks"; fi
+          SIGN="${EXPANDED_CODE_SIGN_IDENTITY:--}"; [ "${CODE_SIGNING_ALLOWED:-NO}" = NO ] && SIGN=-
+          for s in $SRCS; do
+            for f in "$s"/qemu-x86_64-softmmu*.framework "$s"/qemu-img.framework; do
+              [ -d "$f" ] || continue
+              rsync -a "$f" "$FWD/"
+              # build ids like org.qemu.qemu-x86_64-softmmu break Xcode (underscores): use the app prefix + letters only
+              plutil -replace CFBundleIdentifier -string "$PRODUCT_BUNDLE_IDENTIFIER.$(basename "$f" .framework | tr -cd A-Za-z0-9)" "$FWD/$(basename "$f")/Info.plist"
+              codesign --force --sign "$SIGN" --timestamp=none "$FWD/$(basename "$f")"
+            done
+          done
+          rsync -a "$X/fw/" "$APPDIR/x86pc-fw/"
+        basedOnDependencyAnalysis: false
+      - name: Embed Windows engine
+        # build/windows from scripts/build-windows-engine.sh (device only). MadeiraRuntime.framework is dlopened
+        # by WindowsView when the Windows engine starts; its resources go to the app root because Madeira finds
+        # them through Bundle.main. Madeira's helper extensions get IDs under Triptych's.
+        script: |
+          set -e
+          if [ "$PLATFORM_NAME" != "iphoneos" ]; then exit 0; fi
+          W="$SRCROOT/../build/windows"
+          [ -d "$W/MadeiraRuntime.framework" ] || { echo "warning: Windows engine not built (scripts/build-windows-engine.sh)"; exit 0; }
+          APPDIR="$TARGET_BUILD_DIR/$WRAPPER_NAME"
+          FWD="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"; mkdir -p "$FWD" "$APPDIR/PlugIns"
+          rsync -a "$W/MadeiraRuntime.framework" "$FWD/"
+          for f in "$W"/Frameworks/*.framework; do
+            [ "$(basename "$f")" = StikJIT.framework ] && continue
+            rsync -a "$f" "$FWD/"
+          done
+          for d in "$W"/Frameworks/*.dylib; do [ -e "$d" ] && cp "$d" "$FWD/"; done
+          rsync -a "$W/Resources/" "$APPDIR/"
+          # One JIT script for the app (StikJIT rule): Madeira's own lookup gets the merged one too.
+          cp "$SRCROOT/../build/resources/triptych-jit.js" "$APPDIR/madeira-jit.js"
+          for x in "$W"/PlugIns/*.appex; do
+            [ -e "$x" ] || continue
+            n=$(basename "$x" .appex); rsync -a "$x" "$APPDIR/PlugIns/"
+            # Madeira finds the memory host as <app id>.MemoryHost (DonorPool.m) and its JIT helper by file name
+            # (JITBuiltInHost.swift; it reads the ID from the extension, which must not clash with Henge's .JITHelper).
+            case $n in MadeiraMemoryHost) id=MemoryHost;; *) id=$n;; esac
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $PRODUCT_BUNDLE_IDENTIFIER.$id" "$APPDIR/PlugIns/$n.appex/Info.plist"
+          done
+          if [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ] && [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then
+            for f in "$FWD"/*.framework "$FWD"/*.dylib "$APPDIR"/PlugIns/Madeira*.appex; do
+              [ -e "$f" ] && codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none "$f"
+            done
+          fi
+        basedOnDependencyAnalysis: false
+    preBuildScripts:
+      - name: Build Curator llama.cpp
+        script: |
+          set -e
+          export PATH="/opt/homebrew/bin:/opt/local/bin:/usr/local/bin:$PATH"
+          "$SRCROOT/../scripts/build-curator-llama.sh" "$PLATFORM_NAME"
+        basedOnDependencyAnalysis: false
+      - name: Shared JIT script
+        script: |
+          mkdir -p "$SRCROOT/../build/resources"
+          python3 "$SRCROOT/../scripts/make-jit-script.py" "$SRCROOT/../upstreams/madeira/app/Madeira/madeira-jit.js" "$SRCROOT/../build/resources/triptych-jit.js"
+        inputFiles:
+          - $(SRCROOT)/../upstreams/madeira/app/Madeira/madeira-jit.js
+          - $(SRCROOT)/../scripts/make-jit-script.py
+        outputFiles:
+          - $(SRCROOT)/../build/resources/triptych-jit.js
+    info:
+      path: Triptych/Info.plist
+      properties:
+        CFBundleDisplayName: Triptych
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        TriptychGitHubClientID: "Ov23liupp3T3prID7usE"
+        TriptychIssueRepo: "RageMC/triptych-issues"
+        TriptychReportRelayURL: "https://triptych-curator-relay.triptych-ragemc.workers.dev/report"
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        CADisableMinimumFrameDurationOnPhone: true
+        UIApplicationSupportsIndirectInputEvents: true
+        UIBackgroundModes: [audio]
+        UIRequiredDeviceCapabilities: [arm64]
+        # Mac apps fetch what they fetch on a Mac: CrossOver downloads Windows installers and fonts from vendors'
+        # plain-http URLs, which App Transport Security would block.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        BGTaskSchedulerPermittedIdentifiers: ["$(PRODUCT_BUNDLE_IDENTIFIER).pairing.*", "$(PRODUCT_BUNDLE_IDENTIFIER).download.*", "$(PRODUCT_BUNDLE_IDENTIFIER).*"]
+        # Windows engine (Madeira) keys.
+        GCSupportsGameMode: true
+        LSSupportsGameMode: true
+        LSApplicationCategoryType: public.app-category.games
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Pane game setup
+            CFBundleTypeRole: Viewer
+            LSItemContentTypes: [app.madeira.setup]
+            LSHandlerRank: Owner
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: app.madeira.setup
+            UTTypeDescription: Pane game setup
+            UTTypeConformsTo: [public.json]
+            UTTypeTagSpecification:
+              public.filename-extension: [madeirasetup]
+        CFBundleURLTypes:
+          - CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER)
+            CFBundleURLSchemes: [henge, madeira]
+        NSCameraUsageDescription: Triptych can use the volume buttons as the trackpad's mouse buttons. Receiving those presses needs the camera active; no video is recorded, saved or shown.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleExternalDisplayNonInteractive:
+              - UISceneConfigurationName: External Display
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).ExternalDisplaySceneDelegate
+        LSSupportsOpeningDocumentsInPlace: true
+        LSApplicationQueriesSchemes: [stikjit, stikdebug, stosdebug, apple-magnifier, localdevvpn]
+        NSLocalNetworkUsageDescription: Triptych pairs with this device to enable JIT (Built-in StikJIT), and downloads Steam games from a PC on this network.
+        NSBonjourServices: [_remotepairing-pairable-host._tcp, _remotepairing._tcp]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.Triptych
+        # Full set (paid account / TrollStore). A free Apple ID signs only
+        # Triptych.personal.entitlements: pass TRIPTYCH_ENTITLEMENTS=Triptych/Triptych.personal.entitlements.
+        TRIPTYCH_ENTITLEMENTS: Triptych/Triptych.entitlements
+        CODE_SIGN_ENTITLEMENTS: $(TRIPTYCH_ENTITLEMENTS)
+        # dynamic-codesigning changes MAP_JIT semantics: with it the Simulator's writes to a MAP_JIT region fault even after pthread_jit_write_protect_np(0).
+        "CODE_SIGN_ENTITLEMENTS[sdk=iphonesimulator*]": Triptych/Triptych.simulator.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: Triptych/Triptych-Bridging-Header.h
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "TRIPTYCH_HAS_LINUX=1", "TRIPTYCH_HAS_MACOS=1"]
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": ["$(inherited)", "$(SRCROOT)/../build/linux/iphonesimulator", "$(SRCROOT)/../build/macos/iphonesimulator", "$(SRCROOT)/../build/winvm/iphonesimulator", "$(SRCROOT)/../build/henge-deps/iphonesimulator/lib", "$(SRCROOT)/../build/rppairing/iphonesimulator"]
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": ["$(inherited)", "$(SRCROOT)/../build/linux/iphoneos", "$(SRCROOT)/../build/macos/iphoneos", "$(SRCROOT)/../build/winvm/iphoneos", "$(SRCROOT)/../build/henge-deps/iphoneos/lib", "$(SRCROOT)/../build/rppairing/iphoneos"]
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../upstreams/llama.cpp/include", "$(SRCROOT)/../upstreams/llama.cpp/ggml/include", "$(SRCROOT)/../engines/gesso/core", "$(SRCROOT)/../engines/gesso/host", "$(SRCROOT)/../engines/gesso/devices", "$(SRCROOT)/../engines/gesso/ios/Henge/Native", "$(SRCROOT)/../engines/gesso/ios/Henge"]
+        OTHER_LDFLAGS: ["$(inherited)", "$(SRCROOT)/../build/curator-llama/$(PLATFORM_NAME)/libcurator_llama.a", "-lc++", "-framework", "Accelerate", "-ltriptych_linux", "-lsqlite3", "-larchive", "-ObjC", "-lhusk_rppairing", "-lhengevm", "-lwinvm", "-lslirp", "-lglib-2.0", "-lintl", "-lpcre2-8", "-liconv", "-lresolv", "-lcompression", "-lz", "-lbz2",
+          "-framework", "Metal", "-framework", "IOSurface", "-framework", "AudioToolbox", "-framework", "AVFAudio", "-framework", "QuartzCore", "-framework", "CoreText", "-framework", "ImageIO", "-framework", "CoreVideo", "-framework", "UniformTypeIdentifiers"]
+        "OTHER_LDFLAGS[sdk=iphoneos*]": ["$(inherited)", "-lhengerestore", "-framework", "MetalKit"]
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+  # Mac apps: macpkg (engines/macapps, imports .dmg/.pkg/.zip) and the loader after engines/macapps/host, as a framework.
+  MacAppsKit:
+    type: framework
+    platform: iOS
+    sources:
+      - path: MacAppsKit
+        excludes: [PerlCommand.c]
+      # In-process Perl for CrossOver's cx tools: built with Perl's embedding flags, which must match
+      # libtriptychperl.a's (scripts/build-perl-ios.sh); its headers stay out of the other files' search paths.
+      - path: MacAppsKit/PerlCommand.c
+        compilerFlags: "-I$(SRCROOT)/../build/perl/$(PLATFORM_NAME)/include -fno-common -DPERL_DARWIN -DNO_THREAD_SAFE_QUERYLOCALE -DNO_POSIX_2008_LOCALE -DHAS_BROKEN_LANGINFO_CODESET -DNO_LOCALE_COLLATE -fno-strict-aliasing -Wno-shorten-64-to-32 -Wno-comma -Wno-unused-parameter"
+      - path: ../engines/gesso/tl/loader/tl_loader.c
+      - path: ../engines/gesso/tl/loader/tl_tlv.S
+      - path: ../engines/gesso/tl/loader/tl_bundle.m
+      - path: ../engines/gesso/tl/loader/tl_stubs.m
+    preBuildScripts:
+      - name: Build macpkg, shims and sample guest
+        script: |
+          set -e
+          "$SRCROOT/../scripts/build-macapps.sh" "$PLATFORM_NAME"
+          # Perl 5.42 (Artistic-1.0 / GPL-1.0+, see CREDITS.md); skipped when build/perl/<sdk> is up to date.
+          "$SRCROOT/../scripts/build-perl-ios.sh" "$PLATFORM_NAME"
+        basedOnDependencyAnalysis: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.MacAppsKit
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        DEFINES_MODULE: YES
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../engines/macapps/dmg", "$(SRCROOT)/../engines/gesso/tl/loader", "$(SRCROOT)/../engines/gesso/ios/Henge/Native"]
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": ["$(SRCROOT)/../build/macapps/iphonesimulator", "$(SRCROOT)/../build/perl/iphonesimulator"]
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": ["$(SRCROOT)/../build/macapps/iphoneos", "$(SRCROOT)/../build/perl/iphoneos"]
+        OTHER_LDFLAGS: ["$(inherited)", "-lmacpkg", "-ltriptychperl", "-lz", "-framework", "Security"]
+  # Henge's translation layer for Mac apps (GPL-2.0-or-later): its own AppKit, so it is kept out of Triptych's
+  # Objective-C class table until a Henge Mac app runs (Triptych/Henge/HengeTLLazy.c); the Mac apps page uses the
+  # engines/macapps shim instead, and only one of the two can be loaded per launch.
+  HengeTL:
+    type: framework
+    platform: iOS
+    sources:
+      - path: ../engines/gesso/ios/Henge/Native/henge-tl.c
+      - path: ../engines/gesso/ios/Henge/Native/henge-tl-app.m
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.HengeTL
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../engines/gesso/core", "$(SRCROOT)/../engines/gesso/host", "$(SRCROOT)/../engines/gesso/devices", "$(SRCROOT)/../engines/gesso/ios/Henge/Native", "$(SRCROOT)/../engines/gesso/ios/Henge"]
+        # The JIT mapping and the VM state come from Triptych itself (henge-vm.c, henge-ios-jit.c), found at load time.
+        OTHER_LDFLAGS: ["$(inherited)", "-Wl,-force_load,$(SRCROOT)/../build/macos/$(PLATFORM_NAME)/libhengetl.a",
+          "-Wl,-U,_henge_ios_jit_get_mapping", "-Wl,-U,_henge_ios_take_high_room", "-Wl,-U,_henge_tl_ran", "-Wl,-U,_henge_vm_state",
+          "-lcompression", "-lz", "-lbz2", "-framework", "Metal", "-framework", "IOSurface", "-framework", "QuartzCore",
+          "-framework", "CoreText", "-framework", "ImageIO", "-framework", "UniformTypeIdentifiers"]
+  # SwiftTerm 1.20.0 (MIT, github.com/migueldeicaza/SwiftTerm), vendored without its build-info plugin.
+  SwiftTerm:
+    type: framework
+    platform: iOS
+    sources:
+      - path: Vendor/SwiftTerm
+        excludes: ["LICENSE"]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.SwiftTerm
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        SKIP_INSTALL: YES
+  # Built-in StikJIT's debugger process (Henge's HengeJITHelper, unmodified), Triptych's single JIT helper. The
+  # product is HengeJITHelper.appex because Henge looks it up by that file name; its id is the app's plus .JITHelper.
+  # The prebuilt StikJIT.xcframework has only an iphoneos slice, so for the Simulator a stub stands in.
+  TriptychJITHelper:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: ../engines/gesso/ios/HengeJITHelper
+        excludes: [Info.plist]
+      - path: TriptychJITHelper
+    settings:
+      base:
+        PRODUCT_NAME: HengeJITHelper
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.Triptych.JITHelper
+        INFOPLIST_FILE: ../engines/gesso/ios/HengeJITHelper/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/../../Frameworks"]
+        "FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]": ["$(SRCROOT)/../upstreams/madeira/app/Frameworks/StikJIT.xcframework/ios-arm64"]
+        "OTHER_LDFLAGS[sdk=iphoneos*]": ["$(inherited)", "-framework", "StikJIT"]
+        "EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]": [HengeJITHelper.swift, RSDPortResolver.swift, RSDPortScanner.swift]
+  TriptychUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [TriptychUITests]
+    dependencies:
+      - target: Triptych
+    settings:
+      base:
+        TEST_TARGET_NAME: Triptych
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.UITests
+        GENERATE_INFOPLIST_FILE: YES
+  TriptychTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [TriptychTests]
+    dependencies:
+      - target: Triptych
+    settings:
+      base:
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Triptych.app/Triptych"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        PRODUCT_BUNDLE_IDENTIFIER: app.triptych.Tests
+        # @testable import Triptych reads the app's bridging header, so the same header paths and defines.
+        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "TRIPTYCH_HAS_LINUX=1", "TRIPTYCH_HAS_MACOS=1"]
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../engines/gesso/core", "$(SRCROOT)/../engines/gesso/host", "$(SRCROOT)/../engines/gesso/devices", "$(SRCROOT)/../engines/gesso/ios/Henge/Native", "$(SRCROOT)/../engines/gesso/ios/Henge"]
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Triptych:
+    build:
+      targets:
+        Triptych: all
+        TriptychTests: [test]
+        TriptychUITests: [test]
+    test:
+      targets: [TriptychTests, TriptychUITests]

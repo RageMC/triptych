@@ -1,0 +1,86 @@
+From 7ef4fe486efab26ac9e194892206b9de9865dd95 Mon Sep 17 00:00:00 2001
+From: Triptych <triptych@localhost>
+Date: Fri, 13 Nov 2026 16:04:56 -0500
+Subject: [PATCH] Embedding entry points for Triptych (madeira_embed_make_root,
+ madeira_embed_open_url)
+
+---
+ app/Madeira/MadeiraApp.swift | 46 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/app/Madeira/MadeiraApp.swift b/app/Madeira/MadeiraApp.swift
+index 10437152..8cca8545 100644
+--- a/app/Madeira/MadeiraApp.swift
++++ b/app/Madeira/MadeiraApp.swift
+@@ -1,9 +1,24 @@
+ import Foundation
+ import SwiftUI
++import UIKit
+ 
+ @main
+ struct MadeiraApp: App {
+-    init() {
++    init() { MadeiraBoot.run() }
++
++    var body: some Scene {
++        WindowGroup { MadeiraRootView() }
++    }
++}
++
++/// Start-up work, shared by the Madeira app and by hosts that embed Madeira
++/// (Triptych loads this binary as a dynamic library and calls the C entry points below).
++@MainActor
++enum MadeiraBoot {
++    private static var done = false
++    static func run() {
++        if done { return }
++        done = true
+         // Opt-in iPhone pointer experiments (PhonePointer.m): before any scene exists.
+         madeira_phone_pointer_setup()
+         // madeira-bcd: the Metal Performance HUD's performance insights (the
+@@ -27,9 +42,10 @@ struct MadeiraApp: App {
+         // Read the cached library before the first grid page is built.
+         if LibraryGridArm.enabled, SteamOwnedLibrary.enabled { SteamOwnedLibrary.shared.start() }
+     }
++}
+ 
+-    var body: some Scene {
+-        WindowGroup {
++struct MadeiraRootView: View {
++    var body: some View {
+             ContentView()
+                 .background(InteractionFrameRateInstaller())   // touch frame-rate request (New library grid)
+                 .modifier(ClaimGamepadEvents())
+@@ -49,6 +65,28 @@ struct MadeiraApp: App {
+                     if JITNetworkShortcut.shared.handle(url) || GameSetupInbox.shared.handle(url) { return }
+                     ShortcutRouter.shared.handle(url)
+                 }
+-        }
++    }
++}
++
++// MARK: - Embedding (Triptych)
++
++/// Returns a retained UIViewController that shows Madeira. Runs the start-up work once.
++@_cdecl("madeira_embed_make_root")
++public func madeira_embed_make_root() -> UnsafeMutableRawPointer {
++    MainActor.assumeIsolated {
++        MadeiraBoot.run()
++        let vc = UIHostingController(rootView: MadeiraRootView())
++        return Unmanaged.passRetained(vc as UIViewController).toOpaque()
++    }
++}
++
++/// Hands a URL (madeira://…, a .madeirasetup file) to Madeira. Returns 1 if it was used.
++@_cdecl("madeira_embed_open_url")
++public func madeira_embed_open_url(_ cstr: UnsafePointer<CChar>) -> Int32 {
++    guard let url = URL(string: String(cString: cstr)) else { return 0 }
++    return MainActor.assumeIsolated {
++        if JITNetworkShortcut.shared.handle(url) || GameSetupInbox.shared.handle(url) { return 1 }
++        ShortcutRouter.shared.handle(url)
++        return 1
+     }
+ }
+-- 
+2.46.2
+

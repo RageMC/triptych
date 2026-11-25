@@ -1,0 +1,956 @@
+diff --git a/fs/fake-db.c b/fs/fake-db.c
+index 15c7ad4..2732461 100644
+--- a/fs/fake-db.c
++++ b/fs/fake-db.c
+@@ -299,7 +299,10 @@ static void db_end(struct fakefs_db *fs, sqlite3_stmt *end) {
+     sqlite3_mutex_leave(fs->lock);
+ }
+ void db_commit(struct fakefs_db *fs) { db_end(fs, fs->stmt.commit); }
+-void db_rollback(struct fakefs_db *fs) { db_end(fs, fs->stmt.rollback); }
++void db_rollback(struct fakefs_db *fs) {
++    fs->alias_gen = 0;
++    db_end(fs, fs->stmt.rollback);
++}
+ 
+ static void bind_path(sqlite3_stmt *stmt, int i, const char *path) {
+     sqlite3_bind_blob(stmt, i, path, strlen(path), SQLITE_TRANSIENT);
+@@ -449,14 +452,194 @@ static void sqlite_func_change_prefix(sqlite3_context *context, int argc, sqlite
+     sqlite3_result_blob(context, out_blob, out_size, sqlite3_free);
+ }
+ 
++struct fakefs_case_alias {
++    char *guest;
++    size_t guest_len;
++    char *host;
++    size_t host_len;
++};
++
++static void alias_cache_clear(struct fakefs_db *fs) {
++    for (size_t i = 0; i < fs->alias_count; i++) {
++        free(fs->aliases[i].guest);
++        free(fs->aliases[i].host);
++    }
++    free(fs->aliases);
++    fs->aliases = NULL;
++    fs->alias_count = 0;
++}
++
++static char *dup_blob(sqlite3_stmt *stmt, int col, size_t *out_len) {
++    const void *p = sqlite3_column_blob(stmt, col);
++    int len = sqlite3_column_bytes(stmt, col);
++    if (len < 0) len = 0;
++    char *s = malloc((size_t) len + 1);
++    if (!s) die("out of memory");
++    if (len > 0 && p) memcpy(s, p, (size_t) len);
++    s[len] = '\0';
++    *out_len = (size_t) len;
++    return s;
++}
++
++static void alias_sync_locked(struct fakefs_db *fs) {
++    if (!fs->case_insensitive || fs->alias_gen == fs->generation)
++        return;
++    alias_cache_clear(fs);
++    size_t cap = 0;
++    while (db_exec(fs, fs->stmt.alias_load)) {
++        if (fs->alias_count == cap) {
++            cap = cap ? cap * 2 : 16;
++            struct fakefs_case_alias *next = realloc(fs->aliases, cap * sizeof(*next));
++            if (!next) die("out of memory");
++            fs->aliases = next;
++        }
++        struct fakefs_case_alias *e = &fs->aliases[fs->alias_count++];
++        e->guest = dup_blob(fs->stmt.alias_load, 0, &e->guest_len);
++        e->host = dup_blob(fs->stmt.alias_load, 1, &e->host_len);
++    }
++    db_reset(fs, fs->stmt.alias_load);
++    fs->alias_gen = fs->generation;
++}
++
++static bool alias_rewrite_prefix(const char *path, size_t path_len,
++        size_t from_len, const char *to, size_t to_len,
++        char *out, size_t cap) {
++    size_t tail_len = path_len - from_len;
++    size_t total = to_len + tail_len + 1;
++    if (total > cap)
++        return false;
++    memcpy(out, to, to_len);
++    memcpy(out + to_len, path + from_len, tail_len + 1);
++    return true;
++}
++
++bool fakefs_alias_to_host_locked(struct fakefs_db *fs, const char *guest_path, char *host_out, size_t cap) {
++    size_t guest_len = strlen(guest_path);
++    if (fs->case_insensitive) {
++        alias_sync_locked(fs);
++        const struct fakefs_case_alias *best = NULL;
++        for (size_t i = 0; i < fs->alias_count; i++) {
++            const struct fakefs_case_alias *a = &fs->aliases[i];
++            if (a->guest_len == 0 || a->guest_len > guest_len)
++                continue;
++            if (memcmp(guest_path, a->guest, a->guest_len) != 0)
++                continue;
++            if (guest_path[a->guest_len] != '\0' && guest_path[a->guest_len] != '/')
++                continue;
++            if (!best || a->guest_len > best->guest_len)
++                best = a;
++        }
++        if (best && alias_rewrite_prefix(guest_path, guest_len,
++                best->guest_len, best->host, best->host_len, host_out, cap))
++            return true;
++    }
++    if (guest_len + 1 <= cap)
++        memcpy(host_out, guest_path, guest_len + 1);
++    else if (cap > 0)
++        host_out[0] = '\0';
++    return false;
++}
++
++bool fakefs_alias_from_host_locked(struct fakefs_db *fs, const char *host_path, char *guest_out, size_t cap) {
++    size_t host_len = strlen(host_path);
++    if (fs->case_insensitive) {
++        alias_sync_locked(fs);
++        const struct fakefs_case_alias *best = NULL;
++        for (size_t i = 0; i < fs->alias_count; i++) {
++            const struct fakefs_case_alias *a = &fs->aliases[i];
++            if (a->host_len == 0 || a->host_len > host_len)
++                continue;
++            if (memcmp(host_path, a->host, a->host_len) != 0)
++                continue;
++            if (host_path[a->host_len] != '\0' && host_path[a->host_len] != '/')
++                continue;
++            if (!best || a->host_len > best->host_len)
++                best = a;
++        }
++        if (best && alias_rewrite_prefix(host_path, host_len,
++                best->host_len, best->guest, best->guest_len, guest_out, cap))
++            return true;
++    }
++    if (host_len + 1 <= cap)
++        memcpy(guest_out, host_path, host_len + 1);
++    else if (cap > 0)
++        guest_out[0] = '\0';
++    return false;
++}
++
++void fakefs_alias_set_locked(struct fakefs_db *fs, const char *guest_path, const char *host_path) {
++    if (!fs->case_insensitive)
++        return;
++    bind_path(fs->stmt.alias_set, 1, guest_path);
++    bind_path(fs->stmt.alias_set, 2, host_path);
++    db_exec_reset(fs, fs->stmt.alias_set);
++    fs->alias_gen = 0;
++}
++
++void fakefs_alias_del_locked(struct fakefs_db *fs, const char *guest_path) {
++    if (!fs->case_insensitive)
++        return;
++    bind_path(fs->stmt.alias_del, 1, guest_path);
++    db_exec_reset(fs, fs->stmt.alias_del);
++    fs->alias_gen = 0;
++}
++
++static void bind_prefix_range(sqlite3_stmt *stmt, int idx_slash, int idx_zero, const char *prefix, size_t len) {
++    char buf[len + 1];
++    memcpy(buf, prefix, len);
++    buf[len] = '/';
++    sqlite3_bind_blob(stmt, idx_slash, buf, len + 1, SQLITE_TRANSIENT);
++    buf[len] = '0';
++    sqlite3_bind_blob(stmt, idx_zero, buf, len + 1, SQLITE_TRANSIENT);
++}
++
++void fakefs_alias_rename_locked(struct fakefs_db *fs, const char *guest_src, const char *guest_dst,
++        const char *host_src, const char *host_dst, bool dst_is_aliased) {
++    if (!fs->case_insensitive)
++        return;
++    if (strcmp(guest_src, guest_dst) == 0 && strcmp(host_src, host_dst) == 0)
++        return;
++    size_t guest_src_len = strlen(guest_src);
++    size_t guest_dst_len = strlen(guest_dst);
++    size_t host_src_len = strlen(host_src);
++    if (guest_dst_len > 0) {
++        bind_prefix_range(fs->stmt.alias_del_subtree, 1, 2, guest_dst, guest_dst_len);
++        bind_path(fs->stmt.alias_del_subtree, 3, guest_dst);
++        db_exec_reset(fs, fs->stmt.alias_del_subtree);
++    }
++    if (guest_src_len > 0 && host_src_len > 0) {
++        sqlite3_bind_int64(fs->stmt.alias_rename, 1, guest_src_len);
++        bind_path(fs->stmt.alias_rename, 2, guest_dst);
++        sqlite3_bind_int64(fs->stmt.alias_rename, 3, host_src_len);
++        bind_path(fs->stmt.alias_rename, 4, host_dst);
++        bind_prefix_range(fs->stmt.alias_rename, 5, 6, guest_src, guest_src_len);
++        bind_prefix_range(fs->stmt.alias_rename, 7, 8, host_src, host_src_len);
++        db_exec_reset(fs, fs->stmt.alias_rename);
++        fakefs_alias_del_locked(fs, guest_src);
++    }
++    if (dst_is_aliased)
++        fakefs_alias_set_locked(fs, guest_dst, host_dst);
++    fs->alias_gen = 0;
++}
++
+ extern int fakefs_rebuild(struct fakefs_db *fs, int root_fd);
+ extern int fakefs_migrate(struct fakefs_db *fs, int root_fd);
+ 
+ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
++    memset(&fs->stmt, 0, sizeof(fs->stmt));
+     fs->read_pending = fs->in_txn = false;
+     fs->generation = 1;
+     fs->path_cache = NULL; fs->inode_cache = NULL;
+     fs->cache_hits = fs->cache_misses = 0;
++    fs->aliases = NULL;
++    fs->alias_count = 0;
++    fs->alias_gen = 0;
++    fs->alias_seq = 1;
++#ifdef _PC_CASE_SENSITIVE
++    fs->case_insensitive = (root_fd >= 0 && fpathconf(root_fd, _PC_CASE_SENSITIVE) == 0);
++#else
++    fs->case_insensitive = false;
++#endif
+     fs->db_path = strdup(db_path);
+     fs->db_fd = fs->wal_fd = -1;   // opened only if the WAL index is unavailable
+     memset(&fs->file_token, 0, sizeof(fs->file_token));
+@@ -548,6 +731,9 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
+     if (db_exec_oneshot(fs, "delete from stats where not exists (select 1 from paths where inode = stats.inode)") != SQLITE_OK)
+         goto init_fail;
+ 
++    if (db_exec_oneshot(fs, "create table if not exists case_aliases (guest_path blob primary key, host_path blob unique)") != SQLITE_OK)
++        goto init_fail;
++
+     fs->lock = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+     // [T-fakefs-db-init-no-die] Each cached statement must prepare successfully;
+     // a NULL would crash later at runtime. On any failure, fail the mount.
+@@ -569,6 +755,14 @@ int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd) {
+             "where (path >= ? and path < ?) or path = ?");
+     PREPARE_OR_FAIL(path_from_inode, "select path from paths where inode = ?");
+     PREPARE_OR_FAIL(try_cleanup_inode, "delete from stats where inode = ? and not exists (select 1 from paths where inode = stats.inode)");
++    PREPARE_OR_FAIL(alias_load, "select guest_path, host_path from case_aliases");
++    PREPARE_OR_FAIL(alias_set, "insert or replace into case_aliases (guest_path, host_path) values (?, ?)");
++    PREPARE_OR_FAIL(alias_del, "delete from case_aliases where guest_path = ?");
++    PREPARE_OR_FAIL(alias_del_subtree, "delete from case_aliases where (guest_path >= ? and guest_path < ?) or guest_path = ?");
++    PREPARE_OR_FAIL(alias_rename, "update or replace case_aliases "
++            "set guest_path = change_prefix(guest_path, ?, ?), "
++            "host_path = change_prefix(host_path, ?, ?) "
++            "where (guest_path >= ? and guest_path < ?) and (host_path >= ? and host_path < ?)");
+ #undef PREPARE_OR_FAIL
+     return 0;
+ 
+@@ -587,6 +781,7 @@ init_fail:
+ int fake_db_deinit(struct fakefs_db *fs) {
+     free(fs->path_cache); fs->path_cache = NULL;
+     free(fs->inode_cache); fs->inode_cache = NULL;
++    alias_cache_clear(fs);
+     if (fs->db_fd >= 0) close(fs->db_fd);
+     if (fs->wal_fd >= 0) close(fs->wal_fd);
+     fs->db_fd = fs->wal_fd = -1;
+@@ -608,6 +803,11 @@ int fake_db_deinit(struct fakefs_db *fs) {
+         sqlite3_finalize(fs->stmt.path_rename);
+         sqlite3_finalize(fs->stmt.path_from_inode);
+         sqlite3_finalize(fs->stmt.try_cleanup_inode);
++        sqlite3_finalize(fs->stmt.alias_load);
++        sqlite3_finalize(fs->stmt.alias_set);
++        sqlite3_finalize(fs->stmt.alias_del);
++        sqlite3_finalize(fs->stmt.alias_del_subtree);
++        sqlite3_finalize(fs->stmt.alias_rename);
+         return sqlite3_close(fs->db);
+     }
+     return SQLITE_OK;
+diff --git a/fs/fake-db.h b/fs/fake-db.h
+index 00583f7..033f14d 100644
+--- a/fs/fake-db.h
++++ b/fs/fake-db.h
+@@ -5,6 +5,8 @@
+ #include "fs/fix_path.h"
+ #include "misc.h"
+ 
++struct fakefs_case_alias;
++
+ struct fakefs_db {
+     sqlite3 *db;
+     struct {
+@@ -23,6 +25,11 @@ struct fakefs_db {
+         sqlite3_stmt *path_rename;
+         sqlite3_stmt *path_from_inode;
+         sqlite3_stmt *try_cleanup_inode;
++        sqlite3_stmt *alias_load;
++        sqlite3_stmt *alias_set;
++        sqlite3_stmt *alias_del;
++        sqlite3_stmt *alias_del_subtree;
++        sqlite3_stmt *alias_rename;
+     } stmt;
+     sqlite3_mutex *lock;
+     // Read transactions open lazily (only when a query misses the caches),
+@@ -32,6 +39,11 @@ struct fakefs_db {
+     struct fakefs_path_cache_entry *path_cache;
+     struct fakefs_inode_cache_entry *inode_cache;
+     uint64_t cache_hits, cache_misses;
++    // Case-collision aliases for case-insensitive host filesystems (macOS APFS / Simulator).
++    bool case_insensitive;
++    struct fakefs_case_alias *aliases;
++    size_t alias_count;
++    uint64_t alias_gen, alias_seq;
+     // Other processes (the FileProvider extension) may write the same
+     // database: any change of meta.db or its WAL invalidates the caches.
+     char *db_path;
+@@ -76,4 +88,11 @@ void path_link(struct fakefs_db *fs, const char *src, const char *dst);
+ inode_t path_unlink(struct fakefs_db *fs, const char *path);
+ void path_rename(struct fakefs_db *fs, const char *src, const char *dst);
+ 
++bool fakefs_alias_to_host_locked(struct fakefs_db *fs, const char *guest_path, char *host_out, size_t cap);
++bool fakefs_alias_from_host_locked(struct fakefs_db *fs, const char *host_path, char *guest_out, size_t cap);
++void fakefs_alias_set_locked(struct fakefs_db *fs, const char *guest_path, const char *host_path);
++void fakefs_alias_del_locked(struct fakefs_db *fs, const char *guest_path);
++void fakefs_alias_rename_locked(struct fakefs_db *fs, const char *guest_src, const char *guest_dst,
++        const char *host_src, const char *host_dst, bool dst_is_aliased);
++
+ #endif
+diff --git a/fs/fake.c b/fs/fake.c
+index 033e4fe..6eba15d 100644
+--- a/fs/fake.c
++++ b/fs/fake.c
+@@ -3,6 +3,7 @@
+ #include <stdio.h>
+ #include <limits.h>
+ #include <string.h>
++#include <strings.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
+ #include <sys/file.h>
+@@ -294,9 +295,129 @@ static int fakefs_remove_file_caps(struct fd *fd) {
+     return fakefs_caps_allowed(fd) ? file_caps_host_remove(fd->real_fd) : _EOPNOTSUPP;
+ }
+ 
++static bool fakefs_host_exists(struct mount *mount, const char *host_path) {
++    struct stat st;
++    return fstatat(mount->root_fd, fix_path(host_path), &st, AT_SYMLINK_NOFOLLOW) == 0;
++}
++
++static bool fakefs_build_cand_host_locked(struct fakefs_db *fs, const char *guest_path,
++        char *cand_out, size_t cap) {
++    if (guest_path[0] == '\0') {
++        if (cap > 0) cand_out[0] = '\0';
++        return true;
++    }
++    const char *slash = strrchr(guest_path, '/');
++    if (!slash)
++        return false;
++    size_t parent_len = (size_t) (slash - guest_path);
++    char parent_guest[PATH_MAX];
++    if (parent_len >= sizeof(parent_guest))
++        return false;
++    memcpy(parent_guest, guest_path, parent_len);
++    parent_guest[parent_len] = '\0';
++    char parent_host[PATH_MAX];
++    fakefs_alias_to_host_locked(fs, parent_guest, parent_host, sizeof(parent_host));
++    int n = snprintf(cand_out, cap, "%s%s", parent_host, slash);
++    return n >= 0 && (size_t) n < cap;
++}
++
++static bool fakefs_same_dir_case_match(const char *a, const char *b) {
++    if (!a || !b)
++        return false;
++    const char *sa = strrchr(a, '/');
++    const char *sb = strrchr(b, '/');
++    if (!sa || !sb)
++        return false;
++    size_t da = (size_t) (sa - a);
++    size_t db = (size_t) (sb - b);
++    return da == db && memcmp(a, b, da) == 0 && strcasecmp(sa + 1, sb + 1) == 0;
++}
++
++/* Append `.#ish#<seq>` to `cand` until a host path that doesn't exist is found. */
++static int fakefs_next_alias_host_locked(struct mount *mount, const char *cand,
++        char *host_out, size_t cap) {
++    struct fakefs_db *fs = &mount->fakefs;
++    for (int tries = 0; tries < 65536; tries++) {
++        uint64_t seq = fs->alias_seq++;
++        int n = snprintf(host_out, cap, "%s.#ish#%llu", cand, (unsigned long long) seq);
++        if (n < 0 || (size_t) n >= cap)
++            return _ENAMETOOLONG;
++        if (!fakefs_host_exists(mount, host_out))
++            return 0;
++    }
++    return _EEXIST;
++}
++
++/* Determine host path for creating or renaming-to `guest_path` under fs->lock.
++ * On case-insensitive hosts, appends `.#ish#<seq>` if a different-case sibling
++ * occupies `cand` on disk. */
++static int fakefs_prepare_create_host_locked(struct mount *mount, const char *guest_path,
++        const char *self_src_host, char *cand_out, size_t cand_cap,
++        char *host_out, size_t cap, bool *out_aliased) {
++    struct fakefs_db *fs = &mount->fakefs;
++    *out_aliased = false;
++    if (!fs->case_insensitive) {
++        int n = snprintf(host_out, cap, "%s", guest_path);
++        if (n < 0 || (size_t) n >= cap) return _ENAMETOOLONG;
++        if (cand_out) snprintf(cand_out, cand_cap, "%s", host_out);
++        return 0;
++    }
++
++    char cand[PATH_MAX];
++    if (!fakefs_build_cand_host_locked(fs, guest_path, cand, sizeof(cand)))
++        return _ENAMETOOLONG;
++    if (cand_out) {
++        int cn = snprintf(cand_out, cand_cap, "%s", cand);
++        if (cn < 0 || (size_t) cn >= cand_cap) return _ENAMETOOLONG;
++    }
++
++    if (path_get_inode(fs, guest_path) != 0) {
++        fakefs_alias_to_host_locked(fs, guest_path, host_out, cap);
++        *out_aliased = (strcmp(host_out, cand) != 0);
++        return 0;
++    }
++
++    if (self_src_host && fakefs_same_dir_case_match(self_src_host, cand)) {
++        int n = snprintf(host_out, cap, "%s", cand);
++        return (n >= 0 && (size_t) n < cap) ? 0 : _ENAMETOOLONG;
++    }
++
++    if (!fakefs_host_exists(mount, cand)) {
++        int n = snprintf(host_out, cap, "%s", cand);
++        return (n >= 0 && (size_t) n < cap) ? 0 : _ENAMETOOLONG;
++    }
++
++    int err = fakefs_next_alias_host_locked(mount, cand, host_out, cap);
++    if (err == 0)
++        *out_aliased = true;
++    return err;
++}
++
++static void fakefs_resolve_host_unlocked(struct mount *mount, const char *guest_path,
++        char *host_out, size_t cap, bool *exists_in_db) {
++    struct fakefs_db *fs = &mount->fakefs;
++    if (!fs->case_insensitive) {
++        snprintf(host_out, cap, "%s", guest_path);
++        if (exists_in_db) *exists_in_db = true;
++        return;
++    }
++    db_begin_read(fs);
++    bool exists = path_get_inode(fs, guest_path) != 0;
++    if (exists)
++        fakefs_alias_to_host_locked(fs, guest_path, host_out, cap);
++    else
++        snprintf(host_out, cap, "%s", guest_path);
++    db_commit(fs);
++    if (exists_in_db) *exists_in_db = exists;
++}
++
+ static int fakefs_strip_caps_path(struct mount *mount, const char *path) {
+     if (is_under_bind_mount(path)) return 0;
+-    int fd = openat(mount->root_fd, fix_path(path), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
++    char host_path[PATH_MAX];
++    bool exists = false;
++    fakefs_resolve_host_unlocked(mount, path, host_path, sizeof(host_path), &exists);
++    if (!exists) return _ENOENT;
++    int fd = openat(mount->root_fd, fix_path(host_path), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+     if (fd < 0) return errno_map();
+     int err = file_caps_host_remove(fd); close(fd);
+     return err == _ENODATA || err == _EOPNOTSUPP ? 0 : err;
+@@ -340,6 +461,92 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags,
+         }
+         fd->real_fd = fd_no;
+         fd->dir = NULL;
++    } else if (fs->case_insensitive && !is_under_bind_mount(path)) {
++        char host_path[PATH_MAX];
++        if (flags & O_CREAT_) {
++            db_begin_write(fs);
++            ino_t existing = path_get_inode(fs, path);
++            if (existing != 0 && (flags & O_EXCL_)) {
++                db_rollback(fs);
++                return ERR_PTR(_EEXIST);
++            }
++            if (existing != 0) {
++                fakefs_alias_to_host_locked(fs, path, host_path, sizeof(host_path));
++                db_commit(fs);
++                fd = realfs.open(mount, host_path, flags, 0666);
++                if (IS_ERR(fd))
++                    return fd;
++                db_begin_read(fs);
++                fd->fake_inode = path_get_inode(fs, path);
++                db_commit(fs);
++            } else {
++                char cand_path[PATH_MAX];
++                bool need_alias = false;
++                int prep_err = fakefs_prepare_create_host_locked(mount, path, NULL,
++                        cand_path, sizeof(cand_path), host_path, sizeof(host_path), &need_alias);
++                if (prep_err < 0) {
++                    db_rollback(fs);
++                    return ERR_PTR(prep_err);
++                }
++                fd = realfs.open(mount, host_path, flags, 0666);
++                for (int tries = 0; IS_ERR(fd) && PTR_ERR(fd) == _EEXIST && tries < 64; tries++) {
++                    prep_err = fakefs_next_alias_host_locked(mount, cand_path, host_path, sizeof(host_path));
++                    if (prep_err < 0) {
++                        db_rollback(fs);
++                        return ERR_PTR(prep_err);
++                    }
++                    need_alias = true;
++                    fd = realfs.open(mount, host_path, flags, 0666);
++                }
++                if (IS_ERR(fd)) {
++                    db_rollback(fs);
++                    return fd;
++                }
++                struct ish_stat ishstat;
++                ishstat.mode = mode | S_IFREG;
++                ishstat.uid = current->euid;
++                ishstat.gid = current->egid;
++                ishstat.rdev = 0;
++                path_create(fs, path, &ishstat);
++                fd->fake_inode = path_get_inode(fs, path);
++                if (need_alias)
++                    fakefs_alias_set_locked(fs, path, host_path);
++                db_commit(fs);
++            }
++            if (fd->fake_inode == 0) {
++                fd_close(fd);
++                return ERR_PTR(_ENOENT);
++            }
++            fd->inode = inode_get(mount, fd->fake_inode);
++            if (fd->inode == NULL) {
++                fd_close(fd);
++                return ERR_PTR(_ENOMEM);
++            }
++            fd->ops = &fakefs_fdops;
++            fd->file_caps_storage = true;
++            return fd;
++        } else {
++            db_begin_read(fs);
++            ino_t existing = path_get_inode(fs, path);
++            if (existing == 0) {
++                db_rollback(fs);
++                return ERR_PTR(_ENOENT);
++            }
++            fakefs_alias_to_host_locked(fs, path, host_path, sizeof(host_path));
++            db_commit(fs);
++            fd = realfs.open(mount, host_path, flags, 0666);
++            if (IS_ERR(fd))
++                return fd;
++            fd->fake_inode = existing;
++            fd->inode = inode_get(mount, fd->fake_inode);
++            if (fd->inode == NULL) {
++                fd_close(fd);
++                return ERR_PTR(_ENOMEM);
++            }
++            fd->ops = &fakefs_fdops;
++            fd->file_caps_storage = true;
++            return fd;
++        }
+     } else {
+         fd = realfs.open(mount, path, flags, 0666);
+         if (IS_ERR(fd))
+@@ -398,9 +605,11 @@ step:
+         return ERR_PTR(_ENOENT);
+     }
+     const char *path = (const char *) sqlite3_column_text(stmt, 0);
+-    struct fd *fd = realfs.open(mount, path, O_RDWR_, 0);
++    char host_path[PATH_MAX];
++    fakefs_alias_to_host_locked(fs, path, host_path, sizeof(host_path));
++    struct fd *fd = realfs.open(mount, host_path, O_RDWR_, 0);
+     if (PTR_ERR(fd) == _EISDIR)
+-        fd = realfs.open(mount, path, O_RDONLY_, 0);
++        fd = realfs.open(mount, host_path, O_RDONLY_, 0);
+     if (PTR_ERR(fd) == _ENOENT)
+         goto step;
+     if (IS_ERR(fd)) { db_reset(fs, stmt); db_commit(fs); return fd; }
+@@ -417,12 +626,43 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
+     if (is_under_readonly_bind_mount(dst))
+         return _EROFS;
+     db_begin_write(fs);
+-    int err = realfs.link(mount, src, dst);
++    char host_src[PATH_MAX], host_dst[PATH_MAX], cand_dst[PATH_MAX];
++    bool need_alias = false;
++    bool ci = fs->case_insensitive && !is_under_bind_mount(src) && !is_under_bind_mount(dst);
++    if (ci) {
++        if (path_get_inode(fs, src) == 0) {
++            db_rollback(fs);
++            return _ENOENT;
++        }
++        if (path_get_inode(fs, dst) != 0) {
++            db_rollback(fs);
++            return _EEXIST;
++        }
++        fakefs_alias_to_host_locked(fs, src, host_src, sizeof(host_src));
++        int prep_err = fakefs_prepare_create_host_locked(mount, dst, NULL,
++                cand_dst, sizeof(cand_dst), host_dst, sizeof(host_dst), &need_alias);
++        if (prep_err < 0) {
++            db_rollback(fs);
++            return prep_err;
++        }
++    } else {
++        snprintf(host_src, sizeof(host_src), "%s", src);
++        snprintf(host_dst, sizeof(host_dst), "%s", dst);
++    }
++    int err = realfs.link(mount, host_src, host_dst);
++    for (int tries = 0; err == _EEXIST && ci && tries < 64; tries++) {
++        int prep_err = fakefs_next_alias_host_locked(mount, cand_dst, host_dst, sizeof(host_dst));
++        if (prep_err < 0) { err = prep_err; break; }
++        need_alias = true;
++        err = realfs.link(mount, host_src, host_dst);
++    }
+     if (err < 0) {
+         db_rollback(fs);
+         return err;
+     }
+     path_link(fs, src, dst);
++    if (need_alias)
++        fakefs_alias_set_locked(fs, dst, host_dst);
+     db_commit(fs);
+     return 0;
+ }
+@@ -435,12 +675,23 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
+     if (is_under_bind_mount(path))
+         bind_mount_ensure_inode(fs, mount, path);
+     db_begin_write(fs);
+-    int err = realfs.unlink(mount, path);
++    char host_path[PATH_MAX];
++    if (fs->case_insensitive && !is_under_bind_mount(path)) {
++        if (path_get_inode(fs, path) == 0) {
++            db_rollback(fs);
++            return _ENOENT;
++        }
++        fakefs_alias_to_host_locked(fs, path, host_path, sizeof(host_path));
++    } else {
++        snprintf(host_path, sizeof(host_path), "%s", path);
++    }
++    int err = realfs.unlink(mount, host_path);
+     if (err < 0) {
+         db_rollback(fs);
+         return err;
+     }
+     ino_t ino = path_unlink(fs, path);
++    fakefs_alias_del_locked(fs, path);
+     db_commit(fs);
+     inode_check_orphaned(mount, ino);
+     return 0;
+@@ -454,12 +705,23 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
+     if (is_under_bind_mount(path))
+         bind_mount_ensure_inode(fs, mount, path);
+     db_begin_write(fs);
+-    int err = realfs.rmdir(mount, path);
++    char host_path[PATH_MAX];
++    if (fs->case_insensitive && !is_under_bind_mount(path)) {
++        if (path_get_inode(fs, path) == 0) {
++            db_rollback(fs);
++            return _ENOENT;
++        }
++        fakefs_alias_to_host_locked(fs, path, host_path, sizeof(host_path));
++    } else {
++        snprintf(host_path, sizeof(host_path), "%s", path);
++    }
++    int err = realfs.rmdir(mount, host_path);
+     if (err < 0) {
+         db_rollback(fs);
+         return err;
+     }
+     ino_t ino = path_unlink(fs, path);
++    fakefs_alias_del_locked(fs, path);
+     db_commit(fs);
+     inode_check_orphaned(mount, ino);
+     return 0;
+@@ -470,13 +732,39 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst)
+     if (is_under_readonly_bind_mount(src) || is_under_readonly_bind_mount(dst))
+         return _EROFS;
+     db_begin_write(fs);
++    char host_src[PATH_MAX], host_dst[PATH_MAX], cand_dst[PATH_MAX];
++    bool dst_aliased = false;
++    bool ci = fs->case_insensitive && !is_under_bind_mount(src) && !is_under_bind_mount(dst);
++    if (ci) {
++        if (path_get_inode(fs, src) == 0) {
++            db_rollback(fs);
++            return _ENOENT;
++        }
++        fakefs_alias_to_host_locked(fs, src, host_src, sizeof(host_src));
++        int prep_err = fakefs_prepare_create_host_locked(mount, dst, host_src,
++                cand_dst, sizeof(cand_dst), host_dst, sizeof(host_dst), &dst_aliased);
++        if (prep_err < 0) {
++            db_rollback(fs);
++            return prep_err;
++        }
++    } else {
++        snprintf(host_src, sizeof(host_src), "%s", src);
++        snprintf(host_dst, sizeof(host_dst), "%s", dst);
++    }
+     ino_t replaced = path_get_inode(fs, dst);
+-    path_rename(fs, src, dst);
+-    int err = realfs.rename(mount, src, dst);
++    int err = realfs.rename(mount, host_src, host_dst);
++    for (int tries = 0; err == _EEXIST && ci && replaced == 0 && tries < 64; tries++) {
++        int prep_err = fakefs_next_alias_host_locked(mount, cand_dst, host_dst, sizeof(host_dst));
++        if (prep_err < 0) { err = prep_err; break; }
++        dst_aliased = true;
++        err = realfs.rename(mount, host_src, host_dst);
++    }
+     if (err < 0) {
+         db_rollback(fs);
+         return err;
+     }
++    path_rename(fs, src, dst);
++    fakefs_alias_rename_locked(fs, src, dst, host_src, host_dst, dst_aliased);
+     db_commit(fs);
+     if (replaced != 0)
+         inode_check_orphaned(mount, replaced);
+@@ -488,8 +776,34 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
+     if (is_under_readonly_bind_mount(link))
+         return _EROFS;
+     db_begin_write(fs);
++    char host_link[PATH_MAX], cand_link[PATH_MAX];
++    bool need_alias = false;
++    bool ci = fs->case_insensitive && !is_under_bind_mount(link);
++    if (ci) {
++        if (path_get_inode(fs, link) != 0) {
++            db_rollback(fs);
++            return _EEXIST;
++        }
++        int prep_err = fakefs_prepare_create_host_locked(mount, link, NULL,
++                cand_link, sizeof(cand_link), host_link, sizeof(host_link), &need_alias);
++        if (prep_err < 0) {
++            db_rollback(fs);
++            return prep_err;
++        }
++    } else {
++        snprintf(host_link, sizeof(host_link), "%s", link);
++    }
+     // create a file containing the target
+-    int fd = openat(mount->root_fd, fix_path(link), O_WRONLY | O_CREAT | O_EXCL, 0666);
++    int fd = openat(mount->root_fd, fix_path(host_link), O_WRONLY | O_CREAT | O_EXCL, 0666);
++    for (int tries = 0; fd < 0 && errno == EEXIST && ci && tries < 64; tries++) {
++        int prep_err = fakefs_next_alias_host_locked(mount, cand_link, host_link, sizeof(host_link));
++        if (prep_err < 0) {
++            db_rollback(fs);
++            return prep_err;
++        }
++        need_alias = true;
++        fd = openat(mount->root_fd, fix_path(host_link), O_WRONLY | O_CREAT | O_EXCL, 0666);
++    }
+     if (fd < 0) {
+         db_rollback(fs);
+         return errno_map();
+@@ -498,7 +812,7 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
+     close(fd);
+     if (res < 0) {
+         int saved_errno = errno;
+-        unlinkat(mount->root_fd, fix_path(link), 0);
++        unlinkat(mount->root_fd, fix_path(host_link), 0);
+         db_rollback(fs);
+         errno = saved_errno;
+         return errno_map();
+@@ -511,6 +825,8 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
+     ishstat.gid = current->egid;
+     ishstat.rdev = 0;
+     path_create(fs, link, &ishstat);
++    if (need_alias)
++        fakefs_alias_set_locked(fs, link, host_link);
+     db_commit(fs);
+     return 0;
+ }
+@@ -524,11 +840,36 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
+         real_mode |= S_IFREG;
+     else
+         real_mode |= mode & S_IFMT;
+-    int err = realfs.mknod(mount, path, real_mode, 0);
+-    if (err < 0 && err != _EEXIST) {
++    db_begin_write(fs);
++    char host_path[PATH_MAX], cand_path[PATH_MAX];
++    bool need_alias = false;
++    ino_t inode = path_get_inode(fs, path);
++    bool ci = fs->case_insensitive && !is_under_bind_mount(path);
++    if (ci) {
++        if (inode != 0) {
++            db_rollback(fs);
++            return _EEXIST;
++        }
++        int prep_err = fakefs_prepare_create_host_locked(mount, path, NULL,
++                cand_path, sizeof(cand_path), host_path, sizeof(host_path), &need_alias);
++        if (prep_err < 0) {
++            db_rollback(fs);
++            return prep_err;
++        }
++    } else {
++        snprintf(host_path, sizeof(host_path), "%s", path);
++    }
++    int err = realfs.mknod(mount, host_path, real_mode, 0);
++    for (int tries = 0; err == _EEXIST && ci && tries < 64; tries++) {
++        int prep_err = fakefs_next_alias_host_locked(mount, cand_path, host_path, sizeof(host_path));
++        if (prep_err < 0) { err = prep_err; break; }
++        need_alias = true;
++        err = realfs.mknod(mount, host_path, real_mode, 0);
++    }
++    if (err < 0 && (ci || err != _EEXIST)) {
++        db_rollback(fs);
+         return err;
+     }
+-    db_begin_write(fs);
+     struct ish_stat stat;
+     stat.mode = mode;
+     stat.uid = current->euid;
+@@ -536,9 +877,10 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
+     stat.rdev = 0;
+     if (S_ISBLK(mode) || S_ISCHR(mode))
+         stat.rdev = dev;
+-    ino_t inode = path_get_inode(fs, path);
+     if (inode == 0) {
+         path_create(fs, path, &stat);
++        if (need_alias)
++            fakefs_alias_set_locked(fs, path, host_path);
+     } else {
+         inode_write_stat(fs, inode, &stat);
+     }
+@@ -596,7 +938,9 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
+         fake_stat->ctime = platform_stat_ctime_sec(&real_stat);
+         err = 0;
+     } else {
+-        err = realfs.stat(mount, path, fake_stat);
++        char host_path[PATH_MAX];
++        fakefs_alias_to_host_locked(fs, path, host_path, sizeof(host_path));
++        err = realfs.stat(mount, host_path, fake_stat);
+     }
+     db_commit(fs);
+     if (err < 0)
+@@ -649,8 +993,17 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
+     struct fakefs_db *fs = &mount->fakefs;
+     if (is_under_readonly_bind_mount(path))
+         return _EROFS;
+-    if (attr.type == attr_size)
++    if (attr.type == attr_size) {
++        if (fs->case_insensitive && !is_under_bind_mount(path)) {
++            char host_path[PATH_MAX];
++            bool exists = false;
++            fakefs_resolve_host_unlocked(mount, path, host_path, sizeof(host_path), &exists);
++            if (!exists)
++                return _ENOENT;
++            return realfs.setattr(mount, host_path, attr);
++        }
+         return realfs.setattr(mount, path, attr);
++    }
+     if (attr.type == attr_uid || attr.type == attr_gid) {
+         int err = fakefs_strip_caps_path(mount, path); if (err) return err;
+     }
+@@ -700,7 +1053,30 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
+     if (is_under_readonly_bind_mount(path))
+         return _EROFS;
+     db_begin_write(fs);
+-    int err = realfs.mkdir(mount, path, 0777);
++    char host_path[PATH_MAX], cand_path[PATH_MAX];
++    bool need_alias = false;
++    bool ci = fs->case_insensitive && !is_under_bind_mount(path);
++    if (ci) {
++        if (path_get_inode(fs, path) != 0) {
++            db_rollback(fs);
++            return _EEXIST;
++        }
++        int prep_err = fakefs_prepare_create_host_locked(mount, path, NULL,
++                cand_path, sizeof(cand_path), host_path, sizeof(host_path), &need_alias);
++        if (prep_err < 0) {
++            db_rollback(fs);
++            return prep_err;
++        }
++    } else {
++        snprintf(host_path, sizeof(host_path), "%s", path);
++    }
++    int err = realfs.mkdir(mount, host_path, 0777);
++    for (int tries = 0; err == _EEXIST && ci && tries < 64; tries++) {
++        int prep_err = fakefs_next_alias_host_locked(mount, cand_path, host_path, sizeof(host_path));
++        if (prep_err < 0) { err = prep_err; break; }
++        need_alias = true;
++        err = realfs.mkdir(mount, host_path, 0777);
++    }
+     if (err < 0) {
+         db_rollback(fs);
+         return err;
+@@ -711,6 +1087,8 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
+     ishstat.gid = current->egid;
+     ishstat.rdev = 0;
+     path_create(fs, path, &ishstat);
++    if (need_alias)
++        fakefs_alias_set_locked(fs, path, host_path);
+     db_commit(fs);
+     return 0;
+ }
+@@ -739,9 +1117,11 @@ static ssize_t fakefs_readlink(struct mount *mount, const char *path, char *buf,
+         db_rollback(fs);
+         return _EINVAL;
+     }
+-    ssize_t err = realfs.readlink(mount, path, buf, bufsize);
++    char host_path[PATH_MAX];
++    fakefs_alias_to_host_locked(fs, path, host_path, sizeof(host_path));
++    ssize_t err = realfs.readlink(mount, host_path, buf, bufsize);
+     if (err == _EINVAL)
+-        err = file_readlink(mount, path, buf, bufsize);
++        err = file_readlink(mount, host_path, buf, bufsize);
+     db_commit(fs);
+     return err;
+ }
+@@ -762,6 +1142,7 @@ retry:
+     if (strstr(entry_path, "minis") != NULL || strstr(entry_path, "Library/MinisChat") != NULL)
+         fprintf(stderr, "fakefs_readdir: getpath=\"%s\" entry=\"%s\"\n", entry_path, entry->name);
+ 
++    bool is_dot_or_dotdot = (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0);
+     if (strcmp(entry->name, "..") == 0) {
+         if (strcmp(entry_path, "") != 0) {
+             *strrchr(entry_path, '/') = '\0';
+@@ -774,6 +1155,16 @@ retry:
+ 
+     struct fakefs_db *fs = &fd->mount->fakefs;
+     db_begin_read(fs);
++    if (fs->case_insensitive) {
++        char guest_path[MAX_PATH + 1];
++        if (fakefs_alias_from_host_locked(fs, entry_path, guest_path, sizeof(guest_path))) {
++            snprintf(entry_path, sizeof(entry_path), "%s", guest_path);
++            if (!is_dot_or_dotdot) {
++                const char *base = strrchr(guest_path, '/');
++                snprintf(entry->name, sizeof(entry->name), "%s", base ? base + 1 : guest_path);
++            }
++        }
++    }
+     struct ish_stat entry_stat;
+     if (path_read_stat(fs, entry_path, &entry_stat, &entry->inode)) {
+         // Host symlinks are regular payload files in fakefs. d_type must
+@@ -1145,6 +1536,36 @@ static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
+     db_commit(fs);
+ }
+ 
++static int fakefs_getpath(struct fd *fd, char *buf) {
++    int err = realfs_getpath(fd, buf);
++    if (err < 0)
++        return err;
++    struct fakefs_db *fs = &fd->mount->fakefs;
++    if (fs->case_insensitive) {
++        char guest_path[MAX_PATH + 1];
++        db_begin_read(fs);
++        bool aliased = fakefs_alias_from_host_locked(fs, buf, guest_path, sizeof(guest_path));
++        db_commit(fs);
++        if (aliased)
++            memcpy(buf, guest_path, strlen(guest_path) + 1);
++    }
++    return err;
++}
++
++static int fakefs_utime(struct mount *mount, const char *path,
++        struct timespec atime, struct timespec mtime, bool follow_links) {
++    struct fakefs_db *fs = &mount->fakefs;
++    if (fs->case_insensitive && !is_under_bind_mount(path)) {
++        char host_path[PATH_MAX];
++        bool exists = false;
++        fakefs_resolve_host_unlocked(mount, path, host_path, sizeof(host_path), &exists);
++        if (!exists)
++            return _ENOENT;
++        return realfs_utime(mount, host_path, atime, mtime, follow_links);
++    }
++    return realfs_utime(mount, path, atime, mtime, follow_links);
++}
++
+ const struct fs_ops fakefs = {
+     .get_file_caps = fakefs_get_file_caps,
+     .set_file_caps = fakefs_set_file_caps,
+@@ -1167,8 +1588,8 @@ const struct fs_ops fakefs = {
+     .flock = realfs_flock,
+     .setattr = fakefs_setattr,
+     .fsetattr = fakefs_fsetattr,
+-    .getpath = realfs_getpath,
+-    .utime = realfs_utime,
++    .getpath = fakefs_getpath,
++    .utime = fakefs_utime,
+     .futime = realfs_futime,
+ 
+     .mkdir = fakefs_mkdir,

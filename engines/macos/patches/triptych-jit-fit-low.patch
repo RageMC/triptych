@@ -1,0 +1,158 @@
+diff --git a/ios/Henge/JIT/JITBootstrap.swift b/ios/Henge/JIT/JITBootstrap.swift
+index 585bc84..471a8f5 100644
+--- a/ios/Henge/JIT/JITBootstrap.swift
++++ b/ios/Henge/JIT/JITBootstrap.swift
+@@ -151,6 +151,10 @@ enum JITBootstrap {
+             lastFailure = nil
+             HengeLog.log("jit", "no trap servicer, but MAP_JIT executes here -- "
+                              + "QEMU will map its own buffer")
++        } else if henge_ios_jit_landed_high() {
++            lastFailure = "The debugger answered, but iOS placed every code region at an address where generated code "
++                        + "cannot run (too little free room below it). Quit Triptych completely and open it again with JIT; "
++                        + "close other heavy apps first."
+         } else {
+             lastFailure = "The debugger is attached but is not answering trap "
+                         + "requests, and this device will not execute a MAP_JIT "
+@@ -162,7 +166,8 @@ enum JITBootstrap {
+                               + "Henge's script: open Henge from the Home Screen and tap Turn On JIT.")
+         }
+         HengeLog.log("jit", ok ? "JIT region secured; it will be handed to QEMU later"
+-                              : "JIT prewarm FAILED -- StikDebug is not servicing traps")
++                              : henge_ios_jit_landed_high() ? "JIT prewarm FAILED -- every region came back above 0x7000000000"
++                                                             : "JIT prewarm FAILED -- StikDebug is not servicing traps")
+         return ok
+     }
+ 
+diff --git a/ios/Henge/JIT/JITBuiltIn.swift b/ios/Henge/JIT/JITBuiltIn.swift
+index d37a529..1ae3ad4 100644
+--- a/ios/Henge/JIT/JITBuiltIn.swift
++++ b/ios/Henge/JIT/JITBuiltIn.swift
+@@ -96,8 +96,11 @@ enum HengeBuiltInJIT {
+             return
+         }
+         guard let identifier = helperIdentifier else {
+-            fail(2, "Henge's JIT helper is missing from this installation. Reinstall Henge, and keep "
+-                  + "its app extensions if your sideloader asks, or use StikDebug.")
++            fail(2, LiveContainerHost.isHosting
++                  ? "LiveContainer does not install app extensions, so Triptych's built-in JIT helper is not available "
++                    + "here. Set Method to StikDebug, or launch Triptych from LiveContainer with JIT and Triptych's script."
++                  : "Triptych's JIT helper is missing from this installation. Reinstall Triptych, and keep "
++                    + "its app extensions if your sideloader asks, or use StikDebug.")
+             return
+         }
+         if NSClassFromString("NSExtension") == nil {
+diff --git a/ios/Henge/Native/henge-ios-jit.c b/ios/Henge/Native/henge-ios-jit.c
+index e14fdef..5a81393 100644
+--- a/ios/Henge/Native/henge-ios-jit.c
++++ b/ios/Henge/Native/henge-ios-jit.c
+@@ -508,7 +508,43 @@ static void henge_ios_jit_log_map(const char *tag)
+     HENGE_LOG("map[%s]: highest mapped end %#llx", tag, (unsigned long long)prev_end);
+ }
+ 
++/* Triptych: the largest free run below HENGE_JIT_LOW_LIMIT, from 0x100000000 (where the app's image starts) up.
++   The debugger's region is placed first-fit, so a request no gap down here can hold lands above the limit, where
++   generated code never runs (seen on an iPad16,6 with iPadOS 27.2 under LiveContainer: gaps of 394, 936 and 264 MiB,
++   a 1536 MiB request placed at 0x7000b04000 four times in a row). */
++static uint64_t henge_ios_jit_largest_low_gap(void)
++{
++    mach_vm_address_t addr = 0, prev_end = 0x100000000ull;
++    uint64_t best = 0;
++    for (int i = 0; i < 4096; i++) {
++        vm_size_t size = 0;
++        vm_address_t a = (vm_address_t)addr;
++        natural_t depth = 0;
++        struct vm_region_submap_info_64 info;
++        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
++        if (vm_region_recurse_64(mach_task_self(), &a, &size, &depth, (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS) {
++            a = (vm_address_t)HENGE_JIT_LOW_LIMIT; size = 0;
++        }
++        uint64_t lo = prev_end, hi = (uint64_t)a < HENGE_JIT_LOW_LIMIT ? (uint64_t)a : HENGE_JIT_LOW_LIMIT;
++        if (hi > lo && hi - lo > best) best = hi - lo;
++        if ((uint64_t)a >= HENGE_JIT_LOW_LIMIT || size == 0) break;
++        if (a + size > prev_end) prev_end = a + size;
++        addr = a + size;
++    }
++    return best;
++}
++
++/* What to ask the debugger for: the size wanted, or the largest that fits a low gap (16 MiB steps, 256 MiB at least). */
++static size_t henge_ios_jit_fit_low(size_t bytes)
++{
++    uint64_t gap = henge_ios_jit_largest_low_gap() & ~((16ull << 20) - 1);
++    if (gap >= bytes) return bytes;
++    return gap >= (256ull << 20) ? (size_t)gap : 0;
++}
++
+ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes);
++static bool g_jit_landed_high; /* Triptych: the last claim failed only because every region came back above the limit */
++HENGE_EXPORT bool henge_ios_jit_landed_high(void) { return g_jit_landed_high; }
+ 
+ /*
+  * The room for a Mac app's allocators. iOS gives an app with extended virtual addressing 64 GB of high address space,
+@@ -740,6 +776,15 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
+      */
+     henge_ios_jit_log_map("before");
+     henge_ios_jit_release_low_hold(bytes);
++    {   /* Triptych: no low gap holds the full size (the reserved block is gone or never mapped, as under LiveContainer):
++           ask for what fits below the limit rather than for a region that can only land above it. */
++        size_t fit = henge_ios_jit_fit_low(bytes);
++        if (fit && fit < bytes) {
++            HENGE_LOG("#%llu: the largest free room below %#llx is %zu MiB; asking for that instead of %zu MiB",
++                      (unsigned long long)n, HENGE_JIT_LOW_LIMIT, fit >> 20, bytes >> 20);
++            bytes = fit;
++        }
++    }
+     enum { kMaxAttempts = 3 };
+     void *rx = NULL;
+     for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
+@@ -762,11 +807,28 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
+     }
+ 
+     henge_ios_jit_log_map("after");
++    /* Triptych: a region above the limit is kept mapped while a smaller one is asked for, so first-fit cannot hand
++       the same high spot back; up to two smaller tries, each sized to the largest low gap at that moment. */
++    for (int shrink = 0; rx != NULL && (uint64_t)(uintptr_t)rx + bytes > HENGE_JIT_LOW_LIMIT && shrink < 2; shrink++) {
++        size_t fit = henge_ios_jit_fit_low(bytes);
++        if (!fit || fit >= bytes) fit = bytes / 2 >= (256u << 20) ? (bytes / 2) & ~(size_t)((16u << 20) - 1) : 0;
++        if (!fit) break;
++        HENGE_LOG("#%llu: the region came back at %p, above %#llx; holding it and asking for %zu MiB below",
++                  (unsigned long long)n, rx, HENGE_JIT_LOW_LIMIT, fit >> 20);
++        g_expecting_jit_trap = true;
++        void *lower = henge_brk_get_jit_mapping(NULL, fit);
++        g_expecting_jit_trap = false;
++        HENGE_LOG("#%llu: BreakGetJITMapping returned %p for %zu MiB", (unsigned long long)n, lower, fit >> 20);
++        vm_deallocate(mach_task_self(), (vm_address_t)rx, bytes);
++        rx = lower;
++        bytes = fit;
++    }
+     if (rx != NULL && (uint64_t)(uintptr_t)rx + bytes > HENGE_JIT_LOW_LIMIT) {
+         /* Calling into it would hang the app with the debugger still attached. */
+         HENGE_LOG("#%llu: the JIT region came back at %p, above %#llx where generated code does not run; "
+-                  "giving it back. Quit Henge and open it again.", (unsigned long long)n, rx, HENGE_JIT_LOW_LIMIT);
++                  "giving it back. Quit Triptych and open it again.", (unsigned long long)n, rx, HENGE_JIT_LOW_LIMIT);
+         vm_deallocate(mach_task_self(), (vm_address_t)rx, bytes);
++        g_jit_landed_high = true;
+         return region;
+     }
+     if (rx == NULL) {
+@@ -1030,6 +1092,7 @@ bool henge_ios_jit_reserve_bottom(size_t end) { (void)end; return true; }
+ void henge_ios_jit_release(HengeDualMapping *m) { (void)m; }
+ void henge_ios_jit_detach(void) {}
+ bool henge_ios_jit_is_available(void) { return false; }
++bool henge_ios_jit_landed_high(void) { return false; }
+ bool henge_ios_jit_mapjit_works(void) { return false; }
+ const char *henge_ios_jit_self_route(void) { return 0; }
+ void henge_ios_jit_log_footprint(const char *tag) { (void)tag; }
+diff --git a/ios/Henge/Native/henge-ios-jit.h b/ios/Henge/Native/henge-ios-jit.h
+index d793738..c4d2beb 100644
+--- a/ios/Henge/Native/henge-ios-jit.h
++++ b/ios/Henge/Native/henge-ios-jit.h
+@@ -84,6 +84,8 @@ HengeDualMapping henge_ios_jit_allocate(size_t bytes);
+  * will ask for (tb-size).
+  */
+ HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes);
++/* Triptych: true when the last trap claim was answered but every region came back above 0x7000000000. */
++HENGE_EXPORT bool henge_ios_jit_landed_high(void);
+ /* After a prewarm that no debugger answered, allow one more: a debugger traces the process now (the caller checks). */
+ HENGE_EXPORT void henge_ios_jit_prewarm_allow_retry(void);
+ /* The high address blocks held for a Mac app's large reservations (Chromium's allocators), handed out once into

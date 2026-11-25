@@ -1,0 +1,66 @@
+diff --git a/app/Madeira/ConfigCatalog.generated.swift b/app/Madeira/ConfigCatalog.generated.swift
+index effb09af84..966d86268f 100644
+--- a/app/Madeira/ConfigCatalog.generated.swift
++++ b/app/Madeira/ConfigCatalog.generated.swift
+@@ -644,6 +644,7 @@ extension ConfigCatalog {
+         ConfigOption(key: "env.MADEIRA_CLICK_FOCUS", title: "", kind: .text, defaultValue: "", category: "Windows, display & input", note: "0: a tap or click on an active window leaves its keyboard focus as it is", choices: [], sources: ["build/win32u-unix/driver_ios.c"]),
+         ConfigOption(key: "env.MADEIRA_DESKTOP", title: "", kind: .text, defaultValue: "", category: "Windows, display & input", note: "X-desktop probe: shared user32 .data means the 2nd GUI pseudo-process can resolve a NULL winproc (crash: blr NULL in call_window_proc). Log func + resolved procW for the first few calls per process.", choices: [], sources: ["build/win32u-unix/driver_ios.c", "build/win32u-unix/message_ios.c", "build/wineserver/fd_ios.c"]),
+         ConfigOption(key: "env.MADEIRA_DESKTOP_FIT", title: "", kind: .text, defaultValue: "", category: "Windows, display & input", note: "DESKTOP FIT. A presenting window whose client area does not fit the wine desktop (a 1920x1080 window on a 1280x720 desktop) was cropped: only its top-left showed, under a title bar, which looked like a frozen, non-fullscreen game. Its Me...", choices: [], sources: ["app/Madeira/Winios/Winios.m"]),
++        ConfigOption(key: "env.MADEIRA_DESKTOP_TREE_DUMP", title: "", kind: .text, defaultValue: "", category: "Windows, display & input", note: "Desktop debugging: dump the full window tree every ~5s. Runs on this wine thread (valid TEB — the dump walks win32u internals). Off unless MADEIRA_DESKTOP_TREE_DUMP=1: it walked every window of every desktop session twelve times a minute...", choices: [], sources: ["app/Madeira/Winios/Winios.m"]),
+         ConfigOption(key: "env.MADEIRA_DIRECT_CURSOR", title: "", kind: .bool, defaultValue: "1", category: "Windows, display & input", note: "MADEIRA_DIRECT_CURSOR=0: no cursor is drawn on the game view, motion stays relative there and the pointer never locks by itself; the driver reports nothing.", choices: [], sources: ["app/Madeira/HardwareInput.swift"]),
+         ConfigOption(key: "env.MADEIRA_DIRECT_WINDOW_SIZE", title: "", kind: .text, defaultValue: "", category: "Windows, display & input", note: "MADEIRA_DIRECT_WINDOW_SIZE=1: keep an opted-in presenting window's client at the selected resolution, including an engine resize after startup. Default off; desktop sessions and ordinary windowed games are unchanged.", choices: [], sources: ["app/Madeira/Winios/Winios.m"]),
+         ConfigOption(key: "env.MADEIRA_DISPLAY_SYNC", title: "Metal layer: keep display sync", kind: .bool, defaultValue: "0", category: "Windows, display & input", note: "ml2021 A/B: 1 leaves the game's Metal layer in CoreAnimation's display-sync scheduling. Off (the default) sets the private displaySyncEnabled=false (the MeloNX pattern, 2026-07-03). For a title parked 18-72 ms a frame in nextDrawable with the display link honoured at 120 Hz, this is one of the two suspects for late drawables (the other: env.MADEIRA_PROMOTE_KICK).", choices: [], sources: ["app/Madeira/ContentView.swift", "app/Madeira/FPSOverlay.swift"]),
+diff --git a/app/Madeira/Winios/Winios.m b/app/Madeira/Winios/Winios.m
+index d856c050d0..4cdffff2ca 100644
+--- a/app/Madeira/Winios/Winios.m
++++ b/app/Madeira/Winios/Winios.m
+@@ -1043,9 +1043,12 @@ BOOL winios_pProcessEvents(DWORD mask) {
+         fprintf(stderr, "[winios] pProcessEvents called n=%u\n", cnt); fflush(stderr);
+     }
+     /* Desktop debugging: dump the full window tree every ~5s. Runs on
+-     * this wine thread (valid TEB — the dump walks win32u internals). */
++     * this wine thread (valid TEB — the dump walks win32u internals).
++     * Off unless MADEIRA_DESKTOP_TREE_DUMP=1: it walked every window of every desktop session
++     * twelve times a minute and wrote the lot to the log, for a diagnostic nobody asked for. */
+     static int desk = -1;
+-    if (desk < 0) desk = ({ const char *d = getenv("MADEIRA_DESKTOP"); d && *d == '1'; });
++    if (desk < 0) desk = ({ const char *d = getenv("MADEIRA_DESKTOP"), *t = getenv("MADEIRA_DESKTOP_TREE_DUMP");
++                            d && *d == '1' && t && *t == '1'; });
+     if (desk) {
+         static double next_tree_dump;
+         double now = CACurrentMediaTime();
+diff --git a/tests/host/check-desktop-tree-dump.py b/tests/host/check-desktop-tree-dump.py
+new file mode 100644
+index 0000000000..3df1620106
+--- /dev/null
++++ b/tests/host/check-desktop-tree-dump.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""The Wine desktop's window-tree dump is off unless asked for (app/Madeira/Winios/Winios.m).
++
++Every desktop session walked all of its windows twelve times a minute and wrote the result to the
++log. It now needs env.MADEIRA_DESKTOP_TREE_DUMP = 1 as well as the desktop switch the session sets.
++Source checks only: no Wine runs.
++"""
++from pathlib import Path
++import sys
++
++root = Path(__file__).resolve().parents[2]
++winios = (root / 'app/Madeira/Winios/Winios.m').read_text()
++catalog = (root / 'app/Madeira/ConfigCatalog.generated.swift').read_text()
++failures = 0
++
++
++def check(ok, label):
++    global failures
++    print(('PASS: ' if ok else 'FAIL: ') + label)
++    failures += 0 if ok else 1
++
++
++dump = winios[winios.index('Desktop debugging: dump the full window tree'):winios.index('return winios_drain_input();')]
++check('getenv("MADEIRA_DESKTOP_TREE_DUMP")' in dump and "d && *d == '1' && t && *t == '1'" in dump,
++      'the dump needs MADEIRA_DESKTOP_TREE_DUMP=1 besides the desktop switch')
++check('winios_dump_window_tree();' in dump and dump.count('winios_dump_window_tree();') == 1, 'it is still there for whoever turns it on')
++check('MADEIRA_DESKTOP_TREE_DUMP' in catalog, 'the config catalog lists the switch')
++print('PASS' if not failures else f'FAILED ({failures})')
++sys.exit(1 if failures else 0)

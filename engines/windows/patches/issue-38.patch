@@ -1,0 +1,85 @@
+diff --git a/madeira-d3d12/src/pe/madeira_d3d12.c b/madeira-d3d12/src/pe/madeira_d3d12.c
+index 0c3519c..e6e5752 100644
+--- a/madeira-d3d12/src/pe/madeira_d3d12.c
++++ b/madeira-d3d12/src/pe/madeira_d3d12.c
+@@ -1831,2 +1831,6 @@ static int mad_list_type_ok(D3D12_COMMAND_LIST_TYPE t) {
+ }
++/* bcd-games #38: allocators and lists may also be BUNDLEs; a queue may not (D3D12 has no bundle queue). */
++static int mad_list_or_bundle_type_ok(D3D12_COMMAND_LIST_TYPE t) {
++    return mad_list_type_ok(t) || t == D3D12_COMMAND_LIST_TYPE_BUNDLE;
++}
+ 
+@@ -2020,2 +2024,3 @@ static HRESULT STDMETHODCALLTYPE list_Close(ID3D12GraphicsCommandList *This) {
+ }
++static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso);
+ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
+@@ -2024,3 +2029,2 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
+     struct mad_list *l = (struct mad_list *)This;
+-    (void)pso;
+     if (!l->closed) return E_FAIL;         /* reset while recording */
+@@ -2042,2 +2046,3 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
+     mad_list_rings_rewind(l);   /* ml1061: only reuses chunks the GPU has finished with */
++    if (l->type == D3D12_COMMAND_LIST_TYPE_BUNDLE && pso) list_SetPipelineState(This, pso);   /* a bundle's initial state */
+     return S_OK;
+@@ -12104,3 +12109,3 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandAllocator(ID3D12Device *Thi
+     if (!out) return E_INVALIDARG;
+-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
++    if (!mad_list_or_bundle_type_ok(type)) return E_NOTIMPL;
+     struct mad_alloc *a = calloc(1, sizeof *a);
+@@ -12117,5 +12122,5 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
+         ID3D12PipelineState *pso, REFIID riid, void **out) {
+-    (void)This; (void)node; (void)pso;
++    (void)This; (void)node;
+     if (!out || !allocator) return E_INVALIDARG;
+-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
++    if (!mad_list_or_bundle_type_ok(type)) return E_NOTIMPL;
+     if (((struct mad_alloc *)allocator)->type != type) return E_INVALIDARG;
+@@ -12130,2 +12135,3 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
+     l->recorded_generation = l->alloc->generation;
++    if (type == D3D12_COMMAND_LIST_TYPE_BUNDLE && pso) list_SetPipelineState((ID3D12GraphicsCommandList *)l, pso);   /* a bundle's initial state */
+     HRESULT hr = list_QI((ID3D12GraphicsCommandList *)l, riid, out);
+@@ -19772,2 +19800,35 @@ static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *T
+ }
++/* bcd-games #38: bundles. A bundle is recorded once into its own mad_list and closed; ExecuteBundle appends its commands to the
++ * calling list, so the parent replays them with its own encoders and descriptor heaps, and state the bundle sets stays set
++ * afterwards, as in D3D12. The words a command finds in cdata (root constants, CBV latches, clear rectangles) are appended to the
++ * parent's cdata and the command's offset moves with them; the bundle's used resources join the parent's set; the parent's CBV
++ * latch cache is dropped (the bundle may have rebound tables). The bundle may be reset or released afterwards. */
++static void STDMETHODCALLTYPE list_ExecuteBundle(ID3D12GraphicsCommandList *This, ID3D12GraphicsCommandList *bundle) {
++    struct mad_list *l = (struct mad_list *)This, *b = (struct mad_list *)bundle;
++    unsigned i, base, n0;
++    if (!l || l->closed) return;
++    if (!b || b->type != D3D12_COMMAND_LIST_TYPE_BUNDLE || !b->closed || l->type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
++        d3d12_log("[madeira-d3d12] ExecuteBundle refused: bundle %p type %d closed %d into a list of type %d\n", (void *)b,
++                  b ? (int)b->type : -1, b ? b->closed : -1, (int)l->type);
++        return;
++    }
++    if (b->ncdata && !mad_grow((void **)&l->cdata, &l->cdcap, l->ncdata + b->ncdata, sizeof *l->cdata)) return;
++    base = l->ncdata;
++    if (b->ncdata) memcpy(&l->cdata[base], b->cdata, (size_t)b->ncdata * sizeof *l->cdata);
++    l->ncdata += b->ncdata;
++    n0 = l->ncmds;
++    for (i = 0; i < b->ncmds; i++) {
++        struct mad_cmd *c = mad_list_push(l, b->cmds[i].kind);
++        if (!c) { l->ncmds = n0; return; }   /* all or nothing */
++        *c = b->cmds[i];
++        switch (c->kind) {
++        case MC_ROOT_CONST: case MC_CROOT_CONST: c->u.rconst.data += base; break;
++        case MC_CBV_LATCH: c->u.latch.data += base; break;
++        case MC_CLEAR_RT: case MC_CLEAR_DS: if (c->u.clear.nrect) c->u.clear.rect_at += base; break;
++        default: break;
++        }
++    }
++    for (i = 0; i < b->nused; i++) mad_list_note_used(l, b->used[i]);
++    memset(l->rec_tab, 0, sizeof l->rec_tab); memset(l->lat_va, 0, sizeof l->lat_va); memset(l->lat_data, 0, sizeof l->lat_data);
++}
+ static void STDMETHODCALLTYPE list_SetGraphicsRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs) {
+@@ -20862,3 +20923,3 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList1(ID3D12Device10 *This,
+     if (flags != D3D12_COMMAND_LIST_FLAG_NONE) return E_INVALIDARG;
+-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
++    if (!mad_list_or_bundle_type_ok(type)) return E_NOTIMPL;
+     struct mad_list *l = calloc(1, sizeof *l);
+@@ -21319,2 +21380,3 @@ static void build_vtables(void) {
+     g_list_vtbl.SetPipelineState        = (void *)list_SetPipelineState;
++    g_list_vtbl.ExecuteBundle           = (void *)list_ExecuteBundle;
+     g_list_vtbl.SetGraphicsRootSignature= (void *)list_SetGraphicsRootSignature;

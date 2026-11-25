@@ -1,0 +1,11 @@
+build/
+dist/
+app/Triptych.xcodeproj/
+*.log
+.DS_Store
+engines/winvm/build/
+
+NVChip
+*.log
+engines/macapps/build/
+engines/macapps/host/build/

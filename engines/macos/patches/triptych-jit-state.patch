@@ -1,0 +1,191 @@
+From 9cf6d26229753c4280dc653a97df84542ce4636a Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 15:32:09 -0500
+Subject: [PATCH] JIT: one state for Settings' Status and the setup sheet (on
+ only once the region is held)
+
+---
+ ios/Henge/HengeApp.swift         |  5 ++++-
+ ios/Henge/JIT/JITBootstrap.swift | 34 ++++++++++++++++++++++++++++++++
+ ios/Henge/JIT/JITBuiltIn.swift   |  6 +++++-
+ ios/Henge/JIT/JITSetup.swift     |  6 +++---
+ ios/Henge/JIT/JITSetupView.swift | 21 +++++++++++++++++++-
+ ios/Henge/SettingsView.swift     |  9 ++++++++-
+ 6 files changed, 74 insertions(+), 7 deletions(-)
+
+diff --git a/ios/Henge/HengeApp.swift b/ios/Henge/HengeApp.swift
+index 3dc902e..6dbc274 100644
+--- a/ios/Henge/HengeApp.swift
++++ b/ios/Henge/HengeApp.swift
+@@ -89,7 +89,10 @@ struct RootView: View {
+                 catch { return } // going into the background cancels this wait
+             }
+         }
+-        .onChange(of: jit.attachGeneration) { _ in JITBootstrap.prewarm() } // the built-in helper attached
++        .onChange(of: jit.attachGeneration) { _ in // the built-in helper attached
++            JITBootstrap.prewarm()
++            jit.objectWillChange.send() // Status and the setup sheet show the claim's outcome (JITBootstrap.state)
++        }
+         .task { // testing only: HENGE_AUTOPILOT
+             await Autopilot.run { mac in
+                 // A session still on screen (its Mac stopped) is closed first: the same value again would start nothing.
+diff --git a/ios/Henge/JIT/JITBootstrap.swift b/ios/Henge/JIT/JITBootstrap.swift
+index c3e7397..585bc84 100644
+--- a/ios/Henge/JIT/JITBootstrap.swift
++++ b/ios/Henge/JIT/JITBootstrap.swift
+@@ -213,6 +213,40 @@ enum JITBootstrap {
+         return prewarm()
+     }
+ 
++    /// What Henge's JIT is, for every place that shows it: Settings' Status and the setup sheet read this one answer, so the
++    /// sheet can no longer say "JIT is on" while Status says Off. A debugger tracing Henge on a TXM device is not JIT yet:
++    /// the region is claimed with that debugger's help, and only once it is held can a Mac start. Inside LiveContainer a
++    /// debugger traces Henge from launch, which the sheet used to count as on while Status (rightly) said Off.
++    enum JITState: Equatable {
++        case on                 // the region is held, or this device lets a debugged process make its own
++        case claiming           // a debugger traces Henge; the region has not been claimed yet
++        case failed(String)     // the last claim failed (lastFailure)
++        case off
++    }
++
++    /// The decision behind `state`, on plain values so it can be tested.
++    static func state(ready: Bool, debugged: Bool, traced: Bool, txm: Bool, failure: String?) -> JITState {
++        if ready { return .on }
++        if let failure { return .failed(failure) }
++        if debugged && (traced || !txm) { return .claiming }
++        return .off
++    }
++
++    /// Cheap after the first call (`ready` tries the self-grant once, before iOS 26); logs nothing.
++    static var state: JITState {
++        state(ready: ready, debugged: debuggedFlag, traced: isTraced, txm: deviceEnforcesTXM, failure: lastFailure)
++    }
++
++    /// The Status line in Settings.
++    static func statusText(_ state: JITState) -> String {
++        switch state {
++        case .on: return "On"
++        case .claiming: return "Debugger attached, region not claimed yet"
++        case .failed: return "Off (the JIT region could not be claimed)"
++        case .off: return "Off"
++        }
++    }
++
+     /// True once this process has told StikDebug to let go.
+     nonisolated(unsafe) static private(set) var detached = false
+ 
+diff --git a/ios/Henge/JIT/JITBuiltIn.swift b/ios/Henge/JIT/JITBuiltIn.swift
+index e5f27ab..d37a529 100644
+--- a/ios/Henge/JIT/JITBuiltIn.swift
++++ b/ios/Henge/JIT/JITBuiltIn.swift
+@@ -111,8 +111,12 @@ enum HengeBuiltInJIT {
+         let found: AnyObject
+         do { found = try factory.extension(withIdentifier: identifier) }
+         catch {
++            // Inside LiveContainer iOS never registered the guest's app extensions, so reinstalling changes nothing.
+             fail(2, "Henge's JIT helper (\(identifier)) could not be found: \(error.localizedDescription) "
+-                  + "Reinstall Henge.")
++                  + (LiveContainerHost.isHosting
++                     ? "LiveContainer does not register its apps' extensions with iOS: launch Henge from LiveContainer "
++                       + "with JIT (StikDebug), or install it directly instead of inside LiveContainer."
++                     : "Reinstall Henge."))
+             return
+         }
+         guard let data = try? JSONEncoder().encode(request) else {
+diff --git a/ios/Henge/JIT/JITSetup.swift b/ios/Henge/JIT/JITSetup.swift
+index a62f8d0..33805db 100644
+--- a/ios/Henge/JIT/JITSetup.swift
++++ b/ios/Henge/JIT/JITSetup.swift
+@@ -260,7 +260,7 @@ final class JITCoordinator: ObservableObject {
+             guard let self else { return }
+             busy = false
+             if attached {
+-                status = "JIT is on."
++                status = "The debugger attached."
+                 error = nil
+                 attachGeneration += 1
+                 log("TrollStore enabled JIT")
+@@ -284,7 +284,7 @@ final class JITCoordinator: ObservableObject {
+             guard let self else { return }
+             busy = false
+             if attached {
+-                status = "JIT is on."
++                status = "The debugger attached."
+                 error = nil
+                 attachGeneration += 1
+                 log("StikDebug attached")
+@@ -383,7 +383,7 @@ final class JITCoordinator: ObservableObject {
+                 log("built-in JIT failed: \(failure)")
+                 showSetup = true
+             } else {
+-                status = "JIT is on."
++                status = "The debugger attached."
+                 error = nil
+                 attachGeneration += 1
+                 log("built-in helper attached")
+diff --git a/ios/Henge/JIT/JITSetupView.swift b/ios/Henge/JIT/JITSetupView.swift
+index 7089eee..cd5725b 100644
+--- a/ios/Henge/JIT/JITSetupView.swift
++++ b/ios/Henge/JIT/JITSetupView.swift
+@@ -282,7 +282,10 @@ struct JITSetupFlow: View {
+ 
+     // MARK: Enable
+ 
+-    private var attached: Bool { jit.attachGeneration > 0 || JITBootstrap.debuggerUsable }
++    /// The same answer Settings' Status shows (JITBootstrap.state): on only once the JIT region is held, not as soon as a
++    /// debugger traces Henge, which inside LiveContainer it does from launch.
++    private var jitState: JITBootstrap.JITState { _ = jit.attachGeneration; return JITBootstrap.state }
++    private var attached: Bool { jitState == .on }
+ 
+     private var enable: some View {
+         page(symbol: "bolt.badge.checkmark", title: "Turn on JIT",
+@@ -304,6 +307,22 @@ struct JITSetupFlow: View {
+                 .padding(16).hengeCard(high: true)
+             } else if attached {
+                 outcome("JIT is on. a Mac can start.", ok: true)
++                    .accessibilityIdentifier("henge-jit-outcome")
++            } else if jit.error == nil, case .failed(let why) = jitState {
++                outcome(why, ok: false).accessibilityIdentifier("henge-jit-outcome")
++            } else if jit.error == nil, jitState == .claiming {
++                HStack(spacing: 11) {
++                    ProgressView().tint(Theme.accent)
++                    Text("A debugger is attached. Claiming the JIT region…")
++                        .font(.system(size: 14)).foregroundStyle(Theme.text)
++                    Spacer(minLength: 0)
++                }
++                .padding(16).hengeCard(high: true)
++                .task { // a debugger that attached outside Henge's own watch (LiveContainer's, StikDebug's app list) is claimed here
++                    try? await Task.sleep(nanoseconds: 1_000_000_000)
++                    if JITBootstrap.state == .claiming { JITBootstrap.prewarm() }
++                    jit.objectWillChange.send()
++                }
+             } else if let error = jit.error {
+                 VStack(alignment: .leading, spacing: 10) {
+                     outcome(error, ok: false)
+diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
+index e74fd41..df3dea2 100644
+--- a/ios/Henge/SettingsView.swift
++++ b/ios/Henge/SettingsView.swift
+@@ -34,11 +34,18 @@ struct SettingsView: View {
+         }
+     }
+ 
++    /// Read through the coordinator so an attach or a claim redraws Status (the state itself lives outside it).
++    private var jitState: JITBootstrap.JITState { _ = jit.attachGeneration; return JITBootstrap.state }
++
+     var body: some View {
+         NavigationStack {
+             Form {
+                 Section("JIT") {
+-                    LabeledContent("Status", value: JITBootstrap.ready ? "On" : "Off")
++                    LabeledContent("Status", value: JITBootstrap.statusText(jitState))
++                        .accessibilityIdentifier("henge-jit-status")
++                    if case .failed(let why) = jitState {
++                        Text(why).font(.footnote).foregroundStyle(.secondary)
++                    }
+                     Picker("Method", selection: $jit.method) {
+                         ForEach(JITMethod.allCases) { Text($0.title).tag($0) }
+                     }
+-- 
+2.46.2
+

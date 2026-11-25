@@ -1,0 +1,107 @@
+diff --git a/ios/Henge/Native/henge-ios-jit.c b/ios/Henge/Native/henge-ios-jit.c
+index 5a81393..e48d2ce 100644
+--- a/ios/Henge/Native/henge-ios-jit.c
++++ b/ios/Henge/Native/henge-ios-jit.c
+@@ -680,41 +680,36 @@ static size_t henge_qemu_top;       /* bytes at the top QEMU holds */
+ HENGE_EXPORT bool henge_ios_jit_reserve_bottom(size_t end)
+ {
+     pthread_mutex_lock(&henge_share_lock);
+-    bool ok = end <= henge_prewarmed.size - henge_qemu_top;
++    size_t top = henge_qemu_top;
++    bool ok = end <= henge_prewarmed.size - top;
+     if (ok && end > henge_runtime_high) henge_runtime_high = end;
+     pthread_mutex_unlock(&henge_share_lock);
+     if (!ok) {
+         fprintf(stderr, "[henge-jit] the native runtime wants %zu MiB of the JIT region, but QEMU holds its top %zu MiB\n",
+-                end >> 20, henge_qemu_top >> 20);
++                end >> 20, top >> 20);
+     }
+     return ok;
+ }
+
+-HengeDualMapping henge_ios_jit_allocate(size_t bytes)
++HengeDualMapping henge_ios_jit_reserve_top(size_t bytes)
+ {
+-    henge_ios_release_high_hold(); /* QEMU is starting: the room is the Mac's */
+-    /*
+-     * Hand back the prewarmed region when it is big enough. QEMU asks for
+-     * exactly tb-size, which is what prewarm was given, so this is the normal
+-     * path -- the fallback below only runs if prewarm never happened.
+-     */
+-    if (henge_prewarmed.rw_addr && henge_prewarmed.size >= bytes) {
++    HengeDualMapping top = { NULL, NULL, 0 };
++    pthread_mutex_lock(&henge_share_lock);
++    if (bytes && henge_prewarmed.rw_addr && bytes <= henge_prewarmed.size && !henge_qemu_top) {
+         size_t off = (henge_prewarmed.size - bytes) & ~(size_t)0x3FFF;
+-        pthread_mutex_lock(&henge_share_lock);
+-        bool fits = henge_runtime_high <= off;
+-        if (fits) henge_qemu_top = henge_prewarmed.size - off;
+-        pthread_mutex_unlock(&henge_share_lock);
+-        if (!fits) {
+-            fprintf(stderr, "[henge-jit] the native runtime already uses %zu MiB of the %zu MiB region; no room for %zu MiB of TCG\n",
+-                    henge_runtime_high >> 20, henge_prewarmed.size >> 20, bytes >> 20);
+-            HengeDualMapping none = { NULL, NULL, 0 };
+-            return none;
++        if (henge_runtime_high <= off) {
++            henge_qemu_top = henge_prewarmed.size - off;
++            top = (HengeDualMapping){ henge_prewarmed.rw_addr + off, henge_prewarmed.rx_addr + off, henge_qemu_top };
+         }
+-        fprintf(stderr, "[henge-jit] using the top %zu MiB of the prewarmed region (%zu MiB)\n",
+-                (henge_prewarmed.size - off) >> 20, henge_prewarmed.size >> 20);
+-        HengeDualMapping top = { henge_prewarmed.rw_addr + off, henge_prewarmed.rx_addr + off, henge_prewarmed.size - off };
+-        return top;
+     }
++    pthread_mutex_unlock(&henge_share_lock);
++    return top;
++}
++
++HengeDualMapping henge_ios_jit_allocate(size_t bytes)
++{
++    henge_ios_release_high_hold(); /* QEMU is starting: the room is the Mac's */
++    if (henge_prewarmed.rw_addr) return henge_ios_jit_reserve_top(bytes);
+     /*
+      * No second trap after a prewarm already went unanswered.
+      * Inside qemu_init there is even less chance StikDebug is listening, and a
+@@ -910,9 +905,17 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
+
+ void henge_ios_jit_release(HengeDualMapping *m)
+ {
+-    if (m == NULL) {
++    if (!m) return;
++    pthread_mutex_lock(&henge_share_lock);
++    if (henge_qemu_top && m->size == henge_qemu_top &&
++        m->rw_addr == henge_prewarmed.rw_addr + (henge_prewarmed.size - henge_qemu_top) &&
++        m->rx_addr == henge_prewarmed.rx_addr + (henge_prewarmed.size - henge_qemu_top)) {
++        henge_qemu_top = 0;
++        *m = (HengeDualMapping){ NULL, NULL, 0 };
++        pthread_mutex_unlock(&henge_share_lock);
+         return;
+     }
++    pthread_mutex_unlock(&henge_share_lock);
+     if (m->rw_addr != NULL) {
+         vm_deallocate(mach_task_self(), (vm_address_t)m->rw_addr, (vm_size_t)m->size);
+         m->rw_addr = NULL;
+@@ -1089,6 +1092,7 @@ bool henge_ios_jit_prewarm(size_t bytes) { (void)bytes; return false; }
+ void henge_ios_jit_prewarm_allow_retry(void) {}
+ bool henge_ios_jit_prewarm_self(size_t bytes) { (void)bytes; return false; }
+ bool henge_ios_jit_reserve_bottom(size_t end) { (void)end; return true; }
++HengeDualMapping henge_ios_jit_reserve_top(size_t bytes) { (void)bytes; return (HengeDualMapping){0}; }
+ void henge_ios_jit_release(HengeDualMapping *m) { (void)m; }
+ void henge_ios_jit_detach(void) {}
+ bool henge_ios_jit_is_available(void) { return false; }
+diff --git a/ios/Henge/Native/henge-ios-jit.h b/ios/Henge/Native/henge-ios-jit.h
+index c4d2beb..9cc468c 100644
+--- a/ios/Henge/Native/henge-ios-jit.h
++++ b/ios/Henge/Native/henge-ios-jit.h
+@@ -102,7 +102,10 @@ HENGE_EXPORT bool henge_ios_jit_prewarm_self(size_t bytes);
+  */
+ HENGE_EXPORT bool henge_ios_jit_reserve_bottom(size_t end);
+
+-/* Release a mapping obtained from henge_ios_jit_allocate(). */
++/* Borrow the top of the prewarmed region, or return an empty mapping. Only one borrower at a time. */
++HengeDualMapping henge_ios_jit_reserve_top(size_t bytes);
++
++/* Release a mapping from allocate or reserve_top, after every user of it has stopped. */
+ void henge_ios_jit_release(HengeDualMapping *m);
+
+ /*

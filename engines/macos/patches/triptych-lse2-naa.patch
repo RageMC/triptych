@@ -1,0 +1,51 @@
+From c2a5964821f65af72b2f354ac547d852564f394c Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:45:33 -0500
+Subject: [PATCH] FEAT_LSE2: honor SCTLR_EL1.nAA (unaligned
+ load-acquire/store-release never fault when set)
+
+---
+ core/exception.c | 6 ++++--
+ core/memop.c     | 9 ++++++++-
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/core/exception.c b/core/exception.c
+index a9d879e..fe4e361 100644
+--- a/core/exception.c
++++ b/core/exception.c
+@@ -59,8 +59,10 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
+                    ec == HV_EC_SP_ALIGN || ((ec == HV_EC_DABT_SAME || ec == HV_EC_DABT_LOWER) && (esr & 0x3f) == 0x21);
+         if (rare && cpu->el == 1 && nrare < 200) { /* kernel only: user code probes features this way all the time */
+             nrare++;
+-            fprintf(stderr, "henge: rare exception ec=%02x esr=%08x far=%llx pc=%llx el%u\n", ec, esr,
+-                    (unsigned long long)far, (unsigned long long)ret, cpu->el);
++            uint32_t insn = 0; uint64_t ipa;
++            if (!hv_mmu_access(cpu, ret, HV_ACC_EXEC, 1, &ipa)) hv_phys_read(cpu->m, ipa, &insn, 4);
++            fprintf(stderr, "henge: rare exception ec=%02x esr=%08x far=%llx pc=%llx el%u insn=%08x sctlr=%llx\n", ec, esr,
++                    (unsigned long long)far, (unsigned long long)ret, cpu->el, insn, (unsigned long long)cpu->sctlr_el1);
+         }
+     }
+     if (type == HV_EXC_SYNC && esr >> 26 == HV_EC_BRK && (esr & 0xffff) == 0xf002 && cpu->el == 1 && cpu->x[16] != 3) { /* 3: symbol loads */
+diff --git a/core/memop.c b/core/memop.c
+index c8a07f5..ad1c34a 100644
+--- a/core/memop.c
++++ b/core/memop.c
+@@ -694,7 +694,14 @@ int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+         break;
+     default: {
+         /* FEAT_LSE2: an unaligned load-acquire or store-release within one 16-byte block is allowed. */
+-        int lse2_ok = cpu->m->lse2 && op.kind == HV_MEM_ORDERED && (va & 15) + op.bytes <= 16;
++        /* FEAT_LSE2: an unaligned load-acquire or store-release doesn't fault if SCTLR_EL1.nAA is set, or if it stays
++           within one 16-byte block. (Windows relies on the first: its lock-free list pop can read a stale, garbage
++           pointer that must take a translation fault, which the kernel recognizes and retries, not an alignment one.) */
++        int lse2_ok = cpu->m->lse2 && op.kind == HV_MEM_ORDERED && (((cpu->sctlr_el1 >> 6) & 1) || (va & 15) + op.bytes <= 16);
++        if (op.align && (va & (op.bytes - 1)) && op.kind == HV_MEM_ORDERED && cpu->m->lse2) {
++            static int told;
++            if (!told++) fprintf(stderr, "henge: unaligned ordered access, SCTLR_EL1.nAA=%d\n", (int)((cpu->sctlr_el1 >> 6) & 1));
++        }
+         if (op.align && (va & (op.bytes - 1)) && !lse2_ok) return alignment_fault(cpu, va, op.store, pc);
+         int pair = op.kind == HV_MEM_PAIR;
+         uint32_t esize = 1u << op.size;
+-- 
+2.46.2
+

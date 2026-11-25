@@ -1,0 +1,59 @@
+--- a/fs/tty.c
++++ b/fs/tty.c
+@@ -17,6 +17,26 @@
+ 
+ // lock this before locking a tty
+ lock_t ttys_lock = LOCK_INITIALIZER;
++static struct winsize_ host_console_size;
++
++void real_tty_set_host_size(unsigned short cols, unsigned short rows) {
++    struct winsize_ size = {.col = cols, .row = rows};
++    dword_t group = 0;
++    lock(&ttys_lock);
++    host_console_size = size;
++    struct tty *tty = real_tty_driver.ttys[1];
++    if (tty) {
++        lock(&tty->lock);
++        if (tty->winsize.col != cols || tty->winsize.row != rows) {
++            tty->winsize = size;
++            group = tty->fg_group;
++        }
++        unlock(&tty->lock);
++    }
++    unlock(&ttys_lock);
++    if (group)
++        send_group_signal(group, SIGWINCH_, SIGINFO_NIL);
++}
+ 
+ struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
+     struct tty *tty = malloc(sizeof(struct tty));
+@@ -76,6 +96,8 @@
+                 return ERR_PTR(err);
+             }
+         }
++        if (driver == &real_tty_driver && num == 1 && host_console_size.col)
++            tty->winsize = host_console_size;
+         driver->ttys[num] = tty;
+     }
+     lock(&tty->lock);
+--- a/xX_main_Xx.h
++++ b/xX_main_Xx.h
+@@ -32,12 +32,18 @@
+     if (task->parent != NULL)
+         return;
+     real_tty_reset_term();
++#ifdef TRIPTYCH_EMBEDDED_CLI
++    // do_exit holds this lock. The host's exit callback only ends this thread.
++    unlock(&pids_lock);
++    exit((code & 0xff) ? 128 + (code & 0xff) : code >> 8);
++#else
+     if (code & 0xff) {
+         // Guest died from a signal. Don't raise on the host (our crash_handler
+         // would intercept it). Just exit with the conventional 128+signal code.
+         _exit(128 + (code & 0xff));
+     }
+     exit(code >> 8);
++#endif
+ }
+ 
+ // this function parses command line arguments and initializes global

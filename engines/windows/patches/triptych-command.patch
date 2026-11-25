@@ -1,0 +1,167 @@
+From 4efe87c5922080c8c7bf00b528ae7ca02f46ec8f Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 14:06:44 -0500
+Subject: [PATCH] Triptych: run Windows commands in a persistent session
+ (madeira_embed_run_command, madeira_embed_stop_prefix)
+
+---
+ app/Madeira/WineProcessBridge.m | 146 ++++++++++++++++++++++++++++++++
+ 1 file changed, 146 insertions(+)
+
+diff --git a/app/Madeira/WineProcessBridge.m b/app/Madeira/WineProcessBridge.m
+index d528ab5..9237409 100644
+--- a/app/Madeira/WineProcessBridge.m
++++ b/app/Madeira/WineProcessBridge.m
+@@ -3027,3 +3027,149 @@ void madeira_memory_canary(const char *tmpdir) {
+     }
+     fprintf(stderr, "[mem-canary] ml1076 done\n");
+ }
++
++/* ---- Triptych: one Windows command at a time in a persistent session ----
++ * CrossOver Preview inside Triptych runs `wine PROGRAM ARGS` and `wineserver -k|-w`
++ * through Triptych's process shim. A second Wine session cannot start in the same
++ * process (see LibraryModel.sessionsThisRun), so the first command starts one session
++ * for the bottle with Wine's cmd.exe on piped stdin/stdout, and every command is
++ * typed into it as `start "" /wait /b PROGRAM ARGS`, followed by a marker line that
++ * carries the exit code. Exported for Triptych (PaneWineCommand.c finds them by dlsym). */
++#include "WineServerBridge.h"
++
++#define TC_EXPORT __attribute__((visibility("default"), used))
++static pthread_mutex_t g_tc_lock = PTHREAD_MUTEX_INITIALIZER;
++static char g_tc_prefix[PATH_MAX];
++static unsigned g_tc_seq;
++
++static int tc_write_all(int fd, const char *s, size_t n) {
++    for (int waited = 0; n; ) {
++        ssize_t w = write(fd, s, n);
++        if (w > 0) { s += w; n -= (size_t)w; continue; }
++        if (w < 0 && errno != EAGAIN && errno != EINTR) return -errno;
++        if (++waited > 3000) return -ETIMEDOUT;   /* 30 s with a full pipe */
++        usleep(10000);
++    }
++    return 0;
++}
++
++static void tc_put(int fd, const char *s, size_t n) {
++    if (fd < 0) fd = STDERR_FILENO;
++    while (n) { ssize_t w = write(fd, s, n); if (w <= 0) { if (errno == EINTR) continue; return; } s += w; n -= (size_t)w; }
++}
++
++/* cmd.exe treats & | < > ^ ( ) outside double quotes as syntax: escape them with ^. */
++static int tc_cmd_escape(const char *in, char *out, size_t size) {
++    size_t o = 0; int quoted = 0;
++    for (; *in; in++) {
++        if (*in == '"') quoted = !quoted;
++        if (!quoted && strchr("&|<>^()", *in)) { if (o + 1 >= size) return -1; out[o++] = '^'; }
++        if (*in == '\r' || *in == '\n') continue;
++        if (o + 1 >= size) return -1;
++        out[o++] = *in;
++    }
++    out[o] = 0;
++    return 0;
++}
++
++static int tc_wait(int (*ok)(void), int seconds) {
++    for (int i = 0; i < seconds * 50; i++) { if (ok()) return 1; usleep(20000); }
++    return ok();
++}
++static int tc_pipes_open(void) { return madeira_stdin_master >= 0 && madeira_stdout_master >= 0; }
++
++static int tc_start_session(const char *prefix, char *const envp[]) {
++    static const char *keep[] = { "WINEDLLOVERRIDES=", "WINEDEBUG=", "LANG=", "LC_ALL=", "WINE_LARGE_ADDRESS_AWARE=", NULL };
++    for (int i = 0; envp && envp[i]; i++)
++        for (int k = 0; keep[k]; k++)
++            if (!strncmp(envp[i], keep[k], strlen(keep[k]))) {
++                char name[64]; size_t l = strlen(keep[k]) - 1;
++                memcpy(name, keep[k], l); name[l] = 0;
++                setenv(name, envp[i] + l + 1, 1);
++            }
++    setenv("MADEIRA_EXE", "cmd.exe", 1);
++    setenv("MADEIRA_ARGS", "/q", 1);
++    setenv("MADEIRA_STDIN_PIPE", "1", 1);
++    setenv("MADEIRA_STDOUT_PIPE", "1", 1);
++    madeira_seed_prefix_if_needed(prefix);
++    if (!wineserver_is_running() && wineserver_start(prefix) != 0) return -EIO;
++    if (!tc_wait(wineserver_is_ready, 120)) return -ETIMEDOUT;
++    if (wine_process_start(prefix) != 0) return -EIO;
++    if (!tc_wait(tc_pipes_open, 120)) return -ETIMEDOUT;
++    strlcpy(g_tc_prefix, prefix, sizeof g_tc_prefix);
++    return 0;
++}
++
++/* Runs `exe` (a Windows path or a program name such as wineboot.exe) with the Windows
++ * command-line tail `args` in bottle `prefix` and waits for it. Its stdout goes to outFd.
++ * Returns the exit status (0-255), or -EBUSY when a session for another bottle is
++ * running (Triptych must restart to switch bottles), or another negative errno. */
++TC_EXPORT int madeira_embed_run_command(const char *prefix, const char *exe, const char *args,
++                                        char *const envp[], int inFd, int outFd, int errFd) {
++    (void)inFd;
++    if (!prefix || prefix[0] != '/' || !exe || !*exe) return -EINVAL;
++    pthread_mutex_lock(&g_tc_lock);
++    int rc = 0;
++    if (!g_tc_prefix[0]) {
++        if (wine_process_is_running()) rc = -EBUSY;   /* Pane's own session is running */
++        else rc = tc_start_session(prefix, envp);
++        if (rc) { pthread_mutex_unlock(&g_tc_lock); return rc; }
++    } else if (strcmp(g_tc_prefix, prefix) != 0) {
++        pthread_mutex_unlock(&g_tc_lock); return -EBUSY;
++    }
++    if (!wine_process_is_running()) { pthread_mutex_unlock(&g_tc_lock); return -EPIPE; }
++
++    char tail[8192], line[PATH_MAX + 8192 + 128], marker[64];
++    if (tc_cmd_escape(args ? args : "", tail, sizeof tail) != 0) { pthread_mutex_unlock(&g_tc_lock); return -E2BIG; }
++    unsigned seq = ++g_tc_seq;
++    snprintf(marker, sizeof marker, "__TRIPTYCH_RC_%u__ ", seq);
++    int n = snprintf(line, sizeof line, "start \"\" /wait /b \"%s\" %s\r\necho.\r\necho %s%%errorlevel%%\r\n", exe, tail, marker);
++    if (n < 0 || (size_t)n >= sizeof line) { pthread_mutex_unlock(&g_tc_lock); return -E2BIG; }
++    dprintf(STDERR_FILENO, "[triptych-cmd] #%u %s %s\n", seq, exe, args ? args : "");
++    if ((rc = tc_write_all(madeira_stdin_master, line, (size_t)n)) != 0) { pthread_mutex_unlock(&g_tc_lock); return rc; }
++
++    /* Forward output until the marker; hold back enough bytes to never split it. */
++    static char buf[65536];
++    size_t have = 0, mlen = strlen(marker);
++    int status = -EPIPE;
++    for (;;) {
++        ssize_t r = read(madeira_stdout_master, buf + have, sizeof buf - 1 - have);
++        if (r > 0) {
++            have += (size_t)r; buf[have] = 0;
++            char *m = strstr(buf, marker);
++            if (m) {
++                char *end = strchr(m, '\n');
++                if (!end) continue;   /* the exit code's line is not complete yet */
++                /* drop the blank line `echo.` printed just before the marker */
++                size_t keep = (size_t)(m - buf);
++                if (keep >= 2 && buf[keep - 2] == '\r' && buf[keep - 1] == '\n') keep -= 2;
++                else if (keep >= 1 && buf[keep - 1] == '\n') keep -= 1;
++                tc_put(outFd, buf, keep);
++                status = atoi(m + mlen) & 0xFF;
++                break;
++            }
++            if (have > mlen + 16) { size_t give = have - mlen - 16; tc_put(outFd, buf, give); memmove(buf, buf + give, have - give); have -= give; }
++            continue;
++        }
++        if (r == 0) break;   /* cmd.exe ended */
++        if (errno != EAGAIN && errno != EINTR) break;
++        if (!wine_process_is_running()) break;
++        usleep(20000);
++    }
++    if (status == -EPIPE) {
++        tc_put(outFd, buf, have);
++        const char msg[] = "Pane: the Wine session ended; restart Triptych to run Windows programs again\n";
++        tc_put(errFd, msg, sizeof msg - 1);
++    }
++    pthread_mutex_unlock(&g_tc_lock);
++    return status;
++}
++
++/* `wineserver -k`: the session cannot restart in this process, so programs keep running
++ * until Triptych quits. Returns 0, or -EBUSY for a bottle that is not the session's. */
++TC_EXPORT int madeira_embed_stop_prefix(const char *prefix) {
++    pthread_mutex_lock(&g_tc_lock);
++    int rc = (!g_tc_prefix[0] || (prefix && !strcmp(prefix, g_tc_prefix))) ? 0 : -EBUSY;
++    pthread_mutex_unlock(&g_tc_lock);
++    return rc;
++}
+-- 
+2.46.2
+

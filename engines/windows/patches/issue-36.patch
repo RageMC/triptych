@@ -1,0 +1,86 @@
+diff --git a/madeira-d3d12/src/pe/madeira_d3d12.c b/madeira-d3d12/src/pe/madeira_d3d12.c
+index 0c3519c..e6e5752 100644
+--- a/madeira-d3d12/src/pe/madeira_d3d12.c
++++ b/madeira-d3d12/src/pe/madeira_d3d12.c
+@@ -465,3 +465,3 @@ struct mad_device {
+     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
+-    struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
++    struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; obj_handle_t obj; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
+     struct { UINT32 value[4]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 16-byte period) */
+@@ -12441,3 +12447,3 @@ static void mad_hp_free_locked(struct mad_texheap *h, UINT64 off, UINT64 size) {
+ static void mad_mheap_reclaim(struct mad_device *d, int all) {
+-    obj_handle_t done_list[64]; void *done_mem[64]; unsigned nd = 0, i = 0;
++    obj_handle_t done_list[64], done_obj[64]; void *done_mem[64]; unsigned nd, i;
+     UINT64 done;
+@@ -12445,12 +12451,16 @@ static void mad_mheap_reclaim(struct mad_device *d, int all) {
+     done = mad_gpu_completed(d);
+-    EnterCriticalSection(&d->heap_lock);
+-    while (i < d->nmhret && nd < 64) {
+-        if (all || d->mhret[i].serial + 2 <= done) { done_list[nd] = d->mhret[i].heap; done_mem[nd++] = d->mhret[i].mem; d->mhret[i] = d->mhret[--d->nmhret]; }
+-        else i++;
+-    }
+-    LeaveCriticalSection(&d->heap_lock);
+-    for (i = 0; i < nd; i++) {
+-        if (done_list[i]) { mad_unresident(d, done_list[i]); NSObject_release(done_list[i]); }
+-        if (done_mem[i]) VirtualFree(done_mem[i], 0, MEM_RELEASE);   /* ml1154: a file-backed CPU-visible buffer's storage */
+-    }
++    do {   /* Metal-object-lifetime (bcd-games #36): drain every ready entry, in batches of 64 -- textures can queue hundreds a frame */
++        nd = 0; i = 0;
++        EnterCriticalSection(&d->heap_lock);
++        while (i < d->nmhret && nd < 64) {
++            if (all || d->mhret[i].serial + 2 <= done) { done_list[nd] = d->mhret[i].heap; done_obj[nd] = d->mhret[i].obj; done_mem[nd++] = d->mhret[i].mem; d->mhret[i] = d->mhret[--d->nmhret]; }
++            else i++;
++        }
++        LeaveCriticalSection(&d->heap_lock);
++        for (i = 0; i < nd; i++) {
++            if (done_list[i]) { mad_unresident(d, done_list[i]); NSObject_release(done_list[i]); }
++            if (done_obj[i]) NSObject_release(done_obj[i]);
++            if (done_mem[i]) VirtualFree(done_mem[i], 0, MEM_RELEASE);   /* ml1154: a file-backed CPU-visible buffer's storage */
++        }
++    } while (nd == 64);
+ }
+@@ -14682,2 +14692,20 @@ static HRESULT STDMETHODCALLTYPE res_QI(ID3D12Resource *This, REFIID riid, void
+ static ULONG STDMETHODCALLTYPE res_AddRef(ID3D12Resource *This) { return mad_addref((struct mad_obj *)This); }
++/* bcd-games #36: the game releases a texture once its fence says the GPU is past it, but Metal's command buffer teardown
++ * (IOGPUMetalCommandBufferStorageReset) runs later and still retains it. Texture objects go on the ml1148 list and are released
++ * once two more command buffers have completed, like heaps. Releases at once if the list cannot grow. cfg tex-defer = 0 restores
++ * the immediate release. */
++static void mad_release_after_gpu(struct mad_device *d, obj_handle_t o) {
++    static int on = -1; int queued = 0;
++    if (!o) return;
++    if (on < 0) on = mad_cfg_int_pe("tex-defer", 1) ? 1 : 0;
++    if (on && d) {
++        EnterCriticalSection(&d->heap_lock);
++        if (mad_grow((void **)&d->mhret, &d->mhret_cap, d->nmhret + 1, sizeof *d->mhret)) {
++            d->mhret[d->nmhret].heap = 0; d->mhret[d->nmhret].mem = NULL; d->mhret[d->nmhret].obj = o;
++            d->mhret[d->nmhret].serial = (UINT64)d->gpu_serial; d->nmhret++; queued = 1;
++        }
++        LeaveCriticalSection(&d->heap_lock);
++    }
++    if (!queued) NSObject_release(o);
++}
+ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
+@@ -14714,4 +14742,4 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
+         if (r->cpu) mad_tvs_forget(r);   /* madeira-bcd typed-view-shadow: before its memory goes */
+-        { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
+-        { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
++        { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { mad_release_after_gpu(r->owner, r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
++        { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); mad_release_after_gpu(r->owner, r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
+         if (r->metal_bytes) {   /* madeira-bcd metal-gap */
+@@ -14728,4 +14756,4 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
+         if (r->buffer) NSObject_release(r->buffer);
+-        if (r->texture && !r->borrowed) NSObject_release(r->texture);
+-        if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
++        if (r->texture && !r->borrowed) mad_release_after_gpu(r->owner, r->texture);
++        if (r->resolve_tmp) mad_release_after_gpu(r->owner, r->resolve_tmp);
+         if (r->placed_heap) { mad_pl_del(r->placed_heap, r); ID3D12Heap_Release((ID3D12Heap *)r->placed_heap); }   /* ml1145 */
+@@ -14744,3 +14772,3 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
+                 if (mad_grow((void **)&md->mhret, &md->mhret_cap, md->nmhret + 1, sizeof *md->mhret)) {
+-                    md->mhret[md->nmhret].heap = 0; md->mhret[md->nmhret].mem = r->own_mem;
++                    md->mhret[md->nmhret].heap = 0; md->mhret[md->nmhret].obj = 0; md->mhret[md->nmhret].mem = r->own_mem;
+                     md->mhret[md->nmhret].serial = (UINT64)md->gpu_serial; md->nmhret++; queued = 1;
+@@ -15274,3 +15302,3 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
+             if (mad_grow((void **)&hd->mhret, &hd->mhret_cap, hd->nmhret + 1, sizeof *hd->mhret)) {
+-                hd->mhret[hd->nmhret].heap = h->mtl; hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->mhret[hd->nmhret].mem = NULL; hd->nmhret++; queued = 1;
++                hd->mhret[hd->nmhret].heap = h->mtl; hd->mhret[hd->nmhret].obj = 0; hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->mhret[hd->nmhret].mem = NULL; hd->nmhret++; queued = 1;
+             }

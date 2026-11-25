@@ -1,0 +1,81 @@
+From 7441cc2e7737e11507dfd119dd6f7414a67388b2 Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:44:41 -0500
+Subject: [PATCH] PMU at EL0 (pmu_regs boards): PMUSERENR_EL0 gates EL0 access
+ (EN, SW, CR, ER); a refused access traps to EL1 as a system register access
+ (EC 0x18) instead of UNDEFINED. Windows' user mode reads PMCCNTR_EL0; the
+ undefined instruction killed csrss (0xC000021A / CRITICAL_PROCESS_DIED).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/sysreg.c | 32 +++++++++++++++++++++++++++++---
+ 1 file changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/core/sysreg.c b/core/sysreg.c
+index 1064940..4fbc3e2 100644
+--- a/core/sysreg.c
++++ b/core/sysreg.c
+@@ -46,6 +46,21 @@ static uint64_t timer_ctl(uint64_t ctl, uint64_t cval, uint64_t now) {
+     return ctl;
+ }
+ 
++/* The PMU registers EL0 can reach (op1 3: CRn 9 CRm 12-14, and the event counters in CRn 14): a disallowed
++   access traps to EL1 as a system register access (EC 0x18), not as an undefined instruction. */
++static int is_pmu_el0(uint32_t reg) {
++    uint32_t op0 = reg >> 14, op1 = (reg >> 11) & 7, crn = (reg >> 7) & 15, crm = (reg >> 3) & 15;
++    return op0 == 3 && op1 == 3 && ((crn == 9 && crm >= 12 && crm <= 14) || (crn == 14 && crm >= 8));
++}
++
++/* MRS/MSR from EL0 that the PMU's EL0 enables refuse: to EL1 as a trapped system register access. */
++static int sysreg_trap(HvCpu *cpu, uint32_t reg, int rt, int read, uint64_t pc) {
++    uint32_t op0 = reg >> 14, op1 = (reg >> 11) & 7, crn = (reg >> 7) & 15, crm = (reg >> 3) & 15, op2 = reg & 7;
++    uint32_t iss = op0 << 20 | op2 << 17 | op1 << 14 | crn << 10 | (uint32_t)rt << 5 | crm << 1 | (uint32_t)read;
++    hv_raise_sync(cpu, HV_EC_SYSREG, iss, 0, pc);
++    return 1;
++}
++
+ /* EL0 is allowed only a few registers, some gated by SCTLR_EL1 / CNTKCTL_EL1. */
+ static int el0_allowed(HvCpu *cpu, uint32_t reg, int write) {
+     uint64_t k = cpu->cntkctl_el1;
+@@ -63,8 +78,17 @@ static int el0_allowed(HvCpu *cpu, uint32_t reg, int write) {
+     case R(3, 3, 14, 0, 2): case R(3, 3, 14, 0, 6): return !write && ((k >> 1) & 1); /* CNTVCT */
+     case R(3, 3, 14, 3, 0): case R(3, 3, 14, 3, 1): case R(3, 3, 14, 3, 2): return (k >> 8) & 1; /* CNTV_* */
+     case R(3, 3, 14, 2, 0): case R(3, 3, 14, 2, 1): case R(3, 3, 14, 2, 2): return (k >> 9) & 1; /* CNTP_* */
+-    default: return 0;
++    default: break;
++    }
++    if (cpu->m->pmu_regs && is_pmu_el0(reg)) { /* PMUSERENR_EL0: EN 0, SW 1, CR 2, ER 3 */
++        uint64_t u = cpu->pmuserenr;
++        if (reg == R(3, 3, 9, 14, 0)) return !write;                  /* PMUSERENR itself: read-only at EL0 */
++        if (u & 1) return 1;
++        if (reg == R(3, 3, 9, 13, 0)) return !write && ((u >> 2) & 1); /* PMCCNTR: CR */
++        if (reg == R(3, 3, 9, 12, 4)) return write && ((u >> 1) & 1);  /* PMSWINC: SW */
++        return 0;
+     }
++    return 0;
+ }
+ 
+ /* Returns 0 and sets *v, or -1 if the register does not exist. */
+@@ -345,7 +369,8 @@ static int is_pauth_key(uint32_t reg) {
+ int hv_sysreg_mrs(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+     uint32_t reg = (insn >> 5) & 0xffff;
+     int rt = insn & 0x1f;
+-    if (cpu->el == 0 && !el0_allowed(cpu, reg, 0)) return undefined(cpu, pc);
++    if (cpu->el == 0 && !el0_allowed(cpu, reg, 0))
++        return cpu->m->pmu_regs && is_pmu_el0(reg) ? sysreg_trap(cpu, reg, rt, 1, pc) : undefined(cpu, pc);
+     uint64_t v;
+     if (is_pauth_key(reg)) v = 0;
+     else if (read_reg(cpu, reg, &v) != 0) return undefined(cpu, pc);
+@@ -394,7 +419,8 @@ int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+         fprintf(stderr, "msr S%u_%u_C%u_C%u_%u = %llx pc %llx el%u\n", reg >> 14, (reg >> 11) & 7, (reg >> 7) & 15,
+                 (reg >> 3) & 15, reg & 7, (unsigned long long)(rt == 31 ? 0 : cpu->x[rt]), (unsigned long long)pc,
+                 cpu->el);
+-    if (cpu->el == 0 && !el0_allowed(cpu, reg, 1)) return undefined(cpu, pc);
++    if (cpu->el == 0 && !el0_allowed(cpu, reg, 1))
++        return cpu->m->pmu_regs && is_pmu_el0(reg) ? sysreg_trap(cpu, reg, rt, 0, pc) : undefined(cpu, pc);
+     if (write_reg(cpu, reg, rt == 31 ? 0 : cpu->x[rt]) != 0) return undefined(cpu, pc);
+     irq_check(cpu);
+     return 0;
+-- 
+2.46.2
+

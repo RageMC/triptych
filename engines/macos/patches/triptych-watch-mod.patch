@@ -1,0 +1,51 @@
+From 63fd25e189afdbf740f2b7e9b7eaf7e6bb07d89e Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:57:02 -0500
+Subject: [PATCH] Debug: HV_WATCH_MOD logs kernel aborts inside one Windows
+ driver (default fbwf), with a re-walk
+
+---
+ core/exception.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/core/exception.c b/core/exception.c
+index fe4e361..38ce49a 100644
+--- a/core/exception.c
++++ b/core/exception.c
+@@ -65,6 +65,33 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
+                     (unsigned long long)far, (unsigned long long)ret, cpu->el, insn, (unsigned long long)cpu->sctlr_el1);
+         }
+     }
++    /* HV_WATCH_MOD (default "fbwf"): learn a driver's load range from Windows' symbol-load debug service, then log every
++       kernel data/instruction abort taken inside it (a driver that crashes on a fault, to see the faulting access). */
++    static uint64_t wbase, wsize; static int nwatch;
++    if (type == HV_EXC_SYNC && esr >> 26 == HV_EC_BRK && (esr & 0xffff) == 0xf002 && cpu->el == 1 && cpu->x[16] == 3) {
++        const char *want = getenv("HV_WATCH_MOD") ? getenv("HV_WATCH_MOD") : "fbwf";
++        uint64_t pa, sp = 0, info[3] = {0}; char nm[128] = {0};
++        if (!hv_mmu_access(cpu, cpu->x[0] + 8, HV_ACC_READ, 1, &pa) && !hv_phys_read(cpu->m, pa, &sp, 8) && sp &&
++            !hv_mmu_access(cpu, sp, HV_ACC_READ, 1, &pa)) {
++            unsigned len = 4096 - (unsigned)(pa & 0xfff); if (len > 127) len = 127;
++            hv_phys_read(cpu->m, pa, nm, len);
++        }
++        if (*want && strstr(nm, want) && !hv_mmu_access(cpu, cpu->x[1], HV_ACC_READ, 1, &pa) && !hv_phys_read(cpu->m, pa, info, 24)) {
++            wbase = info[0], wsize = (uint32_t)(info[2] >> 32);
++            fprintf(stderr, "henge: watching %s at %llx size %llx\n", nm, (unsigned long long)wbase, (unsigned long long)wsize);
++        }
++    }
++    if (type == HV_EXC_SYNC && wsize && cpu->el == 1 && ret - wbase < wsize && nwatch < 300 &&
++        ((esr >> 26) == HV_EC_DABT_SAME || (esr >> 26) == HV_EC_IABT_SAME)) {
++        nwatch++;
++        uint32_t insn = 0; uint64_t ipa;
++        if (!hv_mmu_access(cpu, ret, HV_ACC_EXEC, 1, &ipa)) hv_phys_read(cpu->m, ipa, &insn, 4);
++        uint64_t fpa = 0;
++        uint32_t rewalk = hv_mmu_access(cpu, far, (esr >> 6) & 1 ? HV_ACC_WRITE : HV_ACC_READ, 1, &fpa); /* 0: maps now */
++        fprintf(stderr, "henge: watched abort esr=%08x far=%llx pc=+%llx insn=%08x rewalk=%x pa=%llx x0=%llx x1=%llx\n", esr,
++                (unsigned long long)far, (unsigned long long)(ret - wbase), insn, rewalk, (unsigned long long)fpa,
++                (unsigned long long)cpu->x[0], (unsigned long long)cpu->x[1]);
++    }
+     if (type == HV_EXC_SYNC && esr >> 26 == HV_EC_BRK && (esr & 0xffff) == 0xf002 && cpu->el == 1 && cpu->x[16] != 3) { /* 3: symbol loads */
+         /* Windows' debug service (DbgPrint and friends): show its text, e.g. the bugcheck's "Fatal System Error". */
+         static int nsvc;
+-- 
+2.46.2
+

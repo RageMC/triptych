@@ -1,0 +1,105 @@
+From e513acf2efa051e1a3c4feb605f5c53b42821897 Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:15:05 -0500
+Subject: [PATCH] net_slirp: hv_net_attach_rx/hv_net_transmit, the NAT for any
+ network device (not only virtio-net)
+
+---
+ host/net_slirp.c | 28 ++++++++++++++++++++++++----
+ host/net_slirp.h |  6 ++++++
+ 2 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/host/net_slirp.c b/host/net_slirp.c
+index bd36b55..fddee34 100644
+--- a/host/net_slirp.c
++++ b/host/net_slirp.c
+@@ -49,6 +49,10 @@ typedef struct Timer {
+ 
+ static Slirp *slirp;
+ static HvVirtioNet *net;
++/* The device frames for the guest go to: virtio-net (hv_net_attach) or any other (hv_net_attach_rx).
++   Returns 0 if it has no room yet (the frame stays queued). */
++static int (*rx_fn)(void *opaque, const uint8_t *frame, uint32_t len);
++static void *rx_opaque;
+ static HvMachine *machine;
+ static Queue to_guest, to_host;
+ static int wake_pipe[2] = {-1, -1};
+@@ -262,15 +266,19 @@ static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
+     }
+ }
+ 
++void hv_net_transmit(const uint8_t *frame, uint32_t len) { if (rx_fn) transmit(NULL, frame, len); }
++
++static int virtio_rx(void *opaque, const uint8_t *frame, uint32_t len) { return hv_virtio_net_receive(opaque, frame, len); }
++
+ void hv_net_poll(void) {
+-    if (!net) return;
++    if (!rx_fn) return;
+     for (;;) {
+         pthread_mutex_lock(&to_guest.mu);
+         Frame f = {0, NULL};
+         if (to_guest.head != to_guest.tail) f = to_guest.f[to_guest.head % QUEUE];
+         pthread_mutex_unlock(&to_guest.mu);
+         if (!f.data) return;
+-        if (!hv_virtio_net_receive(net, f.data, f.len)) return; /* no buffer posted yet: try again later */
++        if (!rx_fn(rx_opaque, f.data, f.len)) return; /* no buffer posted yet: try again later */
+         hv_net_rx_frames++;
+         pthread_mutex_lock(&to_guest.mu);
+         to_guest.head++;
+@@ -279,7 +287,15 @@ void hv_net_poll(void) {
+     }
+ }
+ 
+-int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
++static int attach(HvMachine *m, HvVirtioNet *n, int (*rx)(void *, const uint8_t *, uint32_t), void *opaque);
++
++int hv_net_attach(HvMachine *m, HvVirtioNet *n) { return attach(m, n, virtio_rx, n); }
++
++int hv_net_attach_rx(HvMachine *m, int (*rx)(void *opaque, const uint8_t *frame, uint32_t len), void *opaque) {
++    return rx ? attach(m, NULL, rx, opaque) : -1;
++}
++
++static int attach(HvMachine *m, HvVirtioNet *n, int (*rx)(void *, const uint8_t *, uint32_t), void *opaque) {
+     if (machine) return -1;
+     machine = m;
+     atomic_store(&stopping, 0);
+@@ -320,7 +336,9 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
+         if (slirp_add_unix(slirp, share_socket, &addr, 80) != 0) fprintf(stderr, "hengevm: net: no route to the shared folder\n");
+     }
+     net = n;
+-    n->transmit = transmit;
++    if (n) n->transmit = transmit;
++    rx_opaque = opaque;
++    rx_fn = rx;
+     if (pthread_create(&network_thread, NULL, net_thread, NULL) != 0) { hv_net_detach(); return -1; }
+     thread_started = 1;
+     return 0;
+@@ -353,6 +371,8 @@ void hv_net_detach(void) {
+         wake_pipe[i] = -1;
+     }
+     memset(timers, 0, sizeof timers);
++    rx_fn = NULL;
++    rx_opaque = NULL;
+     net = NULL;
+     machine = NULL;
+ }
+diff --git a/host/net_slirp.h b/host/net_slirp.h
+index fd145df..fb1faf6 100644
+--- a/host/net_slirp.h
++++ b/host/net_slirp.h
+@@ -8,6 +8,12 @@
+ void hv_net_set_share_socket(const char *path);
+ /* User-mode NAT for the guest's virtio-net (see net_slirp.c). Returns 0 on success. */
+ int hv_net_attach(HvMachine *m, HvVirtioNet *n);
++/* The same NAT for another network device: rx gets each frame for the guest (CPU thread, from
++   hv_net_poll) and returns 0 if it has no room yet; the device hands the guest's frames to
++   hv_net_transmit. Returns 0 on success. */
++int hv_net_attach_rx(HvMachine *m, int (*rx)(void *opaque, const uint8_t *frame, uint32_t len), void *opaque);
++/* CPU thread: a frame the guest sent (devices attached with hv_net_attach_rx). */
++void hv_net_transmit(const uint8_t *frame, uint32_t len);
+ /* CPUs must be stopped. Joins the network worker before its machine is freed. */
+ void hv_net_detach(void);
+ /* CPU thread, from the board's tick: hand frames for the guest to the device. */
+-- 
+2.46.2
+

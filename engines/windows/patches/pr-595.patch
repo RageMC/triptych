@@ -1,0 +1,181 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 810993c680..8d175ea8ab 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -174,7 +174,7 @@ jobs:
+       - id: sdk
+         run: bash tools/build/ci-input-key.sh
+       - id: key
+-        run: echo "key=i386-windows-$(git rev-parse HEAD:wine)-$(git rev-parse HEAD:dxmt)-${{ hashFiles('build/wine-i386/**', 'build/dxmt-patches/**', 'tools/build/setup-llvm-mingw.sh', 'tools/build/build-shader-headers.sh') }}" >> "$GITHUB_OUTPUT"
++        run: echo "key=i386-windows-$(git rev-parse HEAD:wine)-$(git rev-parse HEAD:dxmt)-${{ hashFiles('build/wine-i386/**', 'tools/build/prepare-wine-opengl.sh', 'patches/wine-opengl-winios.patch', 'build/dxmt-patches/**', 'tools/build/setup-llvm-mingw.sh', 'tools/build/build-shader-headers.sh') }}" >> "$GITHUB_OUTPUT"
+       - id: cache
+         uses: actions/cache@v4
+         with:
+@@ -243,6 +243,11 @@ jobs:
+         with:
+           name: native-llvm-${{ needs.plan.outputs.sdk }}
+           path: toolchains
++      - name: Check WoW64 allocation address requirements
++        if: matrix.component == 'windows'
++        run: |
++          git submodule update --init --depth 1 wine
++          python3 tests/host/check-wow-address-requirements.py
+       - name: Build or verify runtime component
+         run: python3 tools/build/runtime-components.py build '${{ matrix.component }}'
+       # Each completed component survives a failure in another component or app.
+diff --git a/build/ntdll-unix/build.sh b/build/ntdll-unix/build.sh
+index 2a43bd437a..e5fd46772c 100755
+--- a/build/ntdll-unix/build.sh
++++ b/build/ntdll-unix/build.sh
+@@ -4,6 +4,7 @@ set -e
+ BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
+ REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
+ WINE_SRC="$REPO_ROOT/wine"
++bash "$REPO_ROOT/tools/build/prepare-wine-opengl.sh"
+ WINE_BUILD="$WINE_SRC/build-macos"
+ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+ OBJ_DIR="$BUILD_DIR/obj"
+diff --git a/build/wine-i386/build.sh b/build/wine-i386/build.sh
+index 733b2a1ceb..4ba21cc11f 100755
+--- a/build/wine-i386/build.sh
++++ b/build/wine-i386/build.sh
+@@ -31,6 +31,7 @@
+ set -euo pipefail
+ 
+ R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++bash "$R/tools/build/prepare-wine-opengl.sh"
+ TC="$R/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
+ export PATH="$TC:$PATH"
+ B="$R/wine/build-i386"
+diff --git a/tests/host/check-wow-address-requirements.py b/tests/host/check-wow-address-requirements.py
+new file mode 100644
+index 0000000000..60b2c91685
+--- /dev/null
++++ b/tests/host/check-wow-address-requirements.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++source = (root / 'wine/dlls/wow64/virtual.c').read_text()
++start = source.index('static NTSTATUS mem_extended_parameters_32to64(')
++function = source[start:source.index('\n}\n', start) + 3]
++prefix = r"""
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++typedef uint32_t ULONG;
++typedef uintptr_t ULONG_PTR;
++typedef uint32_t NTSTATUS;
++typedef int BOOL;
++#define STATUS_SUCCESS 0
++#define STATUS_INVALID_PARAMETER 0xc000000dU
++#define ULongToPtr(x) ((void *)(uintptr_t)(x))
++#define ULongToHandle(x) ULongToPtr(x)
++enum { MemExtendedParameterAddressRequirements = 1, MemExtendedParameterNumaNode,
++       MemExtendedParameterPartitionHandle, MemExtendedParameterUserPhysicalHandle,
++       MemExtendedParameterAttributeFlags, MemExtendedParameterImageMachine };
++typedef struct { ULONG LowestStartingAddress, HighestEndingAddress, Alignment; } MEM_ADDRESS_REQUIREMENTS32;
++typedef struct { void *LowestStartingAddress, *HighestEndingAddress; uintptr_t Alignment; } MEM_ADDRESS_REQUIREMENTS;
++typedef struct { ULONG Type, Reserved, Pointer, ULong, Handle; } MEM_EXTENDED_PARAMETER32;
++typedef struct { ULONG Type, Reserved; void *Pointer; ULONG ULong; void *Handle; } MEM_EXTENDED_PARAMETER;
++static ULONG_PTR highest_user_address = 0xffffffffU;
++static MEM_ADDRESS_REQUIREMENTS32 request;
++static _Alignas(max_align_t) unsigned char storage[1024];
++static void *Wow64AllocateTemp(size_t size) { memset(storage, 0, size); return storage; }
++static void *guest_ptr32(ULONG address) { return address == 0x10000 ? &request : NULL; }
++"""
++suffix = r"""
++static unsigned failures;
++static void check(int value, const char *name) {
++    if (!value) { fprintf(stderr, "FAIL: %s\n", name); failures++; }
++}
++int main(void) {
++    MEM_EXTENDED_PARAMETER32 input = { .Type = MemExtendedParameterAddressRequirements, .Pointer = 0x10000 };
++    MEM_EXTENDED_PARAMETER *output;
++    MEM_ADDRESS_REQUIREMENTS *result;
++    ULONG count = 1;
++    request = (MEM_ADDRESS_REQUIREMENTS32){0x10000, 0, 0x10000};
++    check(!mem_extended_parameters_32to64(&output, &input, &count, 1), "alignment-only request accepted");
++    result = output[0].Pointer;
++    check((uintptr_t)result->HighestEndingAddress == highest_user_address, "unspecified ceiling stays in the 32-bit address space");
++    check((uintptr_t)result->LowestStartingAddress == 0x10000 && result->Alignment == 0x10000, "floor and alignment preserved");
++    request.HighestEndingAddress = 0x3fffffff;
++    count = 1;
++    check(!mem_extended_parameters_32to64(&output, &input, &count, 1), "explicit ceiling accepted");
++    check((uintptr_t)((MEM_ADDRESS_REQUIREMENTS *)output[0].Pointer)->HighestEndingAddress == 0x3fffffff, "explicit ceiling preserved");
++    request.HighestEndingAddress = 0;
++    count = 1;
++    check(!mem_extended_parameters_32to64(&output, &input, &count, 0), "unlimited non-placement request accepted");
++    check(!((MEM_ADDRESS_REQUIREMENTS *)output[0].Pointer)->HighestEndingAddress, "non-placement request unchanged");
++    count = 0;
++    check(!mem_extended_parameters_32to64(&output, NULL, &count, 1) && count == 1, "missing requirement inserted");
++    check((uintptr_t)((MEM_ADDRESS_REQUIREMENTS *)output[0].Pointer)->HighestEndingAddress == highest_user_address, "inserted requirement has guest ceiling");
++    highest_user_address = 0x7ffeffff;
++    request.HighestEndingAddress = 0x80000000;
++    count = 1;
++    check(mem_extended_parameters_32to64(&output, &input, &count, 1) == STATUS_INVALID_PARAMETER, "out-of-range ceiling rejected");
++    check(mem_extended_parameters_32to64(&output, NULL, &count, 1) == STATUS_INVALID_PARAMETER, "missing parameter array rejected");
++    return failures != 0;
++}
++"""
++with tempfile.TemporaryDirectory(prefix='madeira-wow-address-') as folder:
++    c = Path(folder) / 'check.c'
++    binary = Path(folder) / 'check'
++    c.write_text(prefix + function + suffix)
++    subprocess.run(['xcrun', 'clang', '-std=c11', '-Wall', '-Wextra', '-Werror', str(c), '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True)
++print('PASS: actual WoW64 parameter conversion preserves the guest ceiling and explicit constraints')
+diff --git a/tools/build/build-wine.sh b/tools/build/build-wine.sh
+index 514067cb2d..00175f62cb 100755
+--- a/tools/build/build-wine.sh
++++ b/tools/build/build-wine.sh
+@@ -7,6 +7,7 @@ MINGW="$ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
+ export PATH="$MINGW:$PATH"
+ 
+ [[ -x "$WINE/configure" ]] || { echo "ERROR: wine submodule is missing" >&2; exit 1; }
++bash "$ROOT/tools/build/prepare-wine-opengl.sh"
+ 
+ # Native macOS build tree. Madeira's iOS unix-side libraries consume config.h,
+ # generated headers, and host build outputs from here. aarch64 is the native
+diff --git a/tools/build/prepare-wine-opengl.sh b/tools/build/prepare-wine-opengl.sh
+new file mode 100644
+index 0000000000..fa8357d445
+--- /dev/null
++++ b/tools/build/prepare-wine-opengl.sh
+@@ -0,0 +1,11 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++WINE="$ROOT/wine"
++PATCH="$ROOT/patches/wine-opengl-winios.patch"
++
++if git -C "$WINE" apply --reverse --check "$PATCH" 2>/dev/null; then
++    exit 0
++fi
++git -C "$WINE" apply --check "$PATCH"
++git -C "$WINE" apply "$PATCH"
+diff --git a/tools/build/runtime-components.json b/tools/build/runtime-components.json
+index 81df841954..9ab38e1c7e 100644
+--- a/tools/build/runtime-components.json
++++ b/tools/build/runtime-components.json
+@@ -38,6 +38,9 @@
+       "madeira-d3d12/src/**",
+       "madeira-d3d12/tests/windows/**",
+       "tools/build/build-wine.sh",
++      "tools/build/prepare-wine-opengl.sh",
++      "tests/host/check-wow-address-requirements.py",
++      "patches/wine-opengl-winios.patch",
+       "tools/build/setup-llvm-mingw.sh",
+       "tools/build/build-shader-headers.sh",
+       "tools/build/build-llvm-ios.sh",
+diff --git a/wine b/wine
+index ddf92babc5..6e02ec5e45 160000
+--- a/wine
++++ b/wine
+@@ -1 +1 @@
+-Subproject commit ddf92babc5ba71f4586cc4713f5a8eb39f63d39b
++Subproject commit 6e02ec5e451e0fc368f858376f4b9a92541cc47b

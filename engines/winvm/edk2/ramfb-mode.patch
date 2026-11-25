@@ -1,0 +1,55 @@
+--- a/OvmfPkg/QemuRamfbDxe/QemuRamfb.c
++++ b/OvmfPkg/QemuRamfbDxe/QemuRamfb.c
+@@ -251,6 +251,9 @@
+   UINTN                     FbSize, MaxFbSize, Pages;
+   UINTN                     FwCfgSize;
+   UINTN                     Index;
++  UINT32                    BootMode;
++  UINT32                    PreferredMode[2];
++  FIRMWARE_CONFIG_ITEM      PreferredModeItem;
+ 
+   if (!QemuFwCfgIsAvailable ()) {
+     DEBUG ((DEBUG_INFO, "Ramfb: no FwCfg\n"));
+@@ -272,8 +275,26 @@
+     return EFI_PROTOCOL_ERROR;
+   }
+ 
++  BootMode = 1; // Stock QEMU defaults to 800 x 600.
++  Status = QemuFwCfgFindFile ("opt/org.triptych/ramfb-mode", &PreferredModeItem, &FwCfgSize);
++  if (!EFI_ERROR (Status) && (FwCfgSize == sizeof (PreferredMode))) {
++    QemuFwCfgSelectItem (PreferredModeItem);
++    QemuFwCfgReadBytes (sizeof (PreferredMode), PreferredMode);
++    PreferredMode[0] = SwapBytes32 (PreferredMode[0]);
++    PreferredMode[1] = SwapBytes32 (PreferredMode[1]);
++    if ((PreferredMode[0] >= 320) && (PreferredMode[0] <= 4096) &&
++        (PreferredMode[1] >= 240) && (PreferredMode[1] <= 4096))
++    {
++      // Keep this as the only mode for the Graphics Console and the OS boot loader.
++      mQemuRamfbModeInfo[0].HorizontalResolution = PreferredMode[0];
++      mQemuRamfbModeInfo[0].VerticalResolution = PreferredMode[1];
++      mQemuRamfbMode.MaxMode = 1;
++      BootMode = 0;
++    }
++  }
++
+   MaxFbSize = 0;
+-  for (Index = 0; Index < ARRAY_SIZE (mQemuRamfbModeInfo); Index++) {
++  for (Index = 0; Index < mQemuRamfbMode.MaxMode; Index++) {
+     mQemuRamfbModeInfo[Index].PixelsPerScanLine =
+       mQemuRamfbModeInfo[Index].HorizontalResolution;
+     mQemuRamfbModeInfo[Index].PixelFormat =
+@@ -313,10 +334,10 @@
+   mQemuRamfbMode.FrameBufferSize = MaxFbSize;
+   mQemuRamfbMode.FrameBufferBase = FbBase;
+ 
+-  //
+-  // 800 x 600
+-  //
+-  QemuRamfbGraphicsOutputSetMode (&mQemuRamfbGraphicsOutput, 1);
++  Status = QemuRamfbGraphicsOutputSetMode (&mQemuRamfbGraphicsOutput, BootMode);
++  if (EFI_ERROR (Status)) {
++    goto FreeFramebuffer;
++  }
+ 
+   //
+   // ramfb vendor devpath

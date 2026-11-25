@@ -1,0 +1,295 @@
+diff --git a/ios/Henge/Machines.swift b/ios/Henge/Machines.swift
+index 30efebc4..84dfecad 100644
+--- a/ios/Henge/Machines.swift
++++ b/ios/Henge/Machines.swift
+@@ -34,6 +34,7 @@ struct VirtualMac: Identifiable, Codable, Hashable {
+ enum GuestMemory {
+     /// Points the engine at the file (it is unlinked as soon as it is open) and returns the size that fits.
+     static func prepare(_ mac: VirtualMac) -> UInt64 {
++        henge_ios_jit_prepare_vm_memory()
+         let file = mac.directory.appendingPathComponent("ram.tmp")
+         setenv("HV_RAM_FILE", file.path, 1)
+         let free = (try? mac.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+diff --git a/ios/Henge/Native/henge-ios-jit.c b/ios/Henge/Native/henge-ios-jit.c
+index fc6f27c0..4e94e972 100644
+--- a/ios/Henge/Native/henge-ios-jit.c
++++ b/ios/Henge/Native/henge-ios-jit.c
+@@ -549,11 +549,23 @@ static void henge_ios_hold_high(void)
+ static void henge_ios_release_high_hold(void)
+ {
+     if (g_high_hold_given) return;
++    uint64_t released = 0;
+     for (int i = 0; i < 3; i++)
+         if (g_high_hold[i]) {
+-            vm_deallocate(mach_task_self(), g_high_hold[i], (vm_size_t)g_high_parts[i].bytes);
+-            g_high_hold[i] = 0;
++            kern_return_t kr = vm_deallocate(mach_task_self(), g_high_hold[i], (vm_size_t)g_high_parts[i].bytes);
++            if (kr == KERN_SUCCESS) {
++                released += g_high_parts[i].bytes;
++                g_high_hold[i] = 0;
++            } else {
++                HENGE_LOG("could not release unused Mac app address room: %s", mach_error_string(kr));
++            }
+         }
++    if (released) HENGE_LOG("released %llu MiB of unused Mac app address reservations for the VM", (unsigned long long)(released >> 20));
++}
++
++HENGE_EXPORT void henge_ios_jit_prepare_vm_memory(void)
++{
++    henge_ios_release_high_hold();
+ }
+ 
+ /* The held blocks, once, for the translation layer to place large reservations in (they stay held: those are mapped
+@@ -999,6 +1011,7 @@ HengeDualMapping henge_ios_jit_allocate(size_t bytes)
+     return henge_ios_jit_allocate_real(bytes);
+ }
+ int henge_ios_take_high_room(void **base, size_t *bytes) { (void)base, (void)bytes; return 0; }
++void henge_ios_jit_prepare_vm_memory(void) {}
+ bool henge_ios_jit_prewarm(size_t bytes) { (void)bytes; return false; }
+ bool henge_ios_jit_prewarm_self(size_t bytes) { (void)bytes; return false; }
+ bool henge_ios_jit_reserve_bottom(size_t end) { (void)end; return true; }
+diff --git a/ios/Henge/Native/henge-ios-jit.h b/ios/Henge/Native/henge-ios-jit.h
+index 1cd10efc..67ef1aac 100644
+--- a/ios/Henge/Native/henge-ios-jit.h
++++ b/ios/Henge/Native/henge-ios-jit.h
+@@ -87,6 +87,9 @@ HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes);
+ /* The high address blocks held for a Mac app's large reservations (Chromium's allocators), handed out once into
+    base[3]/bytes[3]: how many, 0 if none. */
+ int henge_ios_take_high_room(void **base, size_t *bytes);
++/* Release unused Mac app address reservations before sizing or creating a native VM.
++ * Regions already handed to a Mac app and the prewarmed JIT mapping stay valid. */
++HENGE_EXPORT void henge_ios_jit_prepare_vm_memory(void);
+ HENGE_EXPORT bool henge_ios_jit_prewarm_self(size_t bytes);
+ 
+ /*
+diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
+index 344d8a15..403603f8 100644
+--- a/ios/Henge/Native/henge-vm.c
++++ b/ios/Henge/Native/henge-vm.c
+@@ -181,6 +181,7 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
+                           int cpus, const char *resume, const char *ident, char *err, size_t errlen) {
+     { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
+     if (begin_start(err, errlen)) return -1;
++    henge_ios_jit_prepare_vm_memory();
+     HengeDualMapping *jit = henge_ios_jit_get_mapping();
+     if (!jit || !jit->rw_addr) {
+         snprintf(err, errlen, "Henge has no JIT region. Turn on JIT first.");
+@@ -222,6 +223,7 @@ static void on_install_progress(int step, double p, void *user) {
+ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_t ecid, const char *ipsw,
+                      const char *workdir, uint64_t ram_mb, int cpus, char *err, size_t errlen) {
+     if (begin_start(err, errlen)) return -1;
++    henge_ios_jit_prepare_vm_memory();
+     HengeDualMapping *jit = henge_ios_jit_get_mapping();
+     if (!jit || !jit->rw_addr) {
+         snprintf(err, errlen, "Henge has no JIT region. Turn on JIT first.");
+diff --git a/tests/test_jit_high_room.py b/tests/test_jit_high_room.py
+new file mode 100644
+index 00000000..2dadfb51
+--- /dev/null
++++ b/tests/test_jit_high_room.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python3
++"""Exercise the production Mac-app address reservations with real Mach mappings.
++
++Only the reservation code is compiled: this test never attaches a debugger or
++requests executable memory. Large mappings reserve addresses without allocating
++physical RAM. iOS's extended-address range is translated into a host-allocated
++window because macOS cannot guarantee that fixed iOS address range is available. Allocation and
++deallocation still use the real Mach API. Each case runs in its own process.
++"""
++from pathlib import Path
++import argparse
++import subprocess
++import tempfile
++
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument('--simulator', metavar='UDID', help='run inside a booted iOS Simulator')
++args = parser.parse_args()
++sdk = 'iphonesimulator' if args.simulator else 'macosx'
++sdk_path = subprocess.check_output(['xcrun', '--sdk', sdk, '--show-sdk-path'], text=True).strip()
++target = 'arm64-apple-ios17.0-simulator' if args.simulator else 'arm64-apple-macosx14.0'
++
++def execute(command):
++    if args.simulator:
++        command = ['xcrun', 'simctl', 'spawn', args.simulator] + command
++    subprocess.run(command, check=True, timeout=30)
++
++root = Path(__file__).resolve().parents[1]
++source = (root / 'ios/Henge/Native/henge-ios-jit.c').read_text()
++start = source.index('#define HENGE_HIGH_BASE ')
++end = source.index('static HengeDualMapping henge_prewarmed;', start)
++reservation_code = source[start:end]
++harness = r'''
++#include <mach/mach.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++static vm_address_t test_window;
++static int test_fail_release;
++static kern_return_t test_open_window(void) {
++    kern_return_t result = vm_allocate(mach_task_self(), &test_window, 64ull << 30, VM_FLAGS_ANYWHERE);
++    if (result == KERN_SUCCESS) result = vm_deallocate(mach_task_self(), test_window, 64ull << 30);
++    return result;
++}
++static vm_address_t test_actual(vm_address_t logical) {
++    if (logical >= 0x7000000000ull && logical < 0x8000000000ull)
++        return test_window + (logical - 0x7000000000ull);
++    return logical;
++}
++static kern_return_t test_allocate(vm_map_t task, vm_address_t *at, vm_size_t size, int flags) {
++    vm_address_t logical = *at, real = test_actual(logical);
++    kern_return_t result = vm_allocate(task, &real, size, flags);
++    if (result == KERN_SUCCESS) *at = logical >= 0x7000000000ull && logical < 0x8000000000ull ? logical : real;
++    return result;
++}
++static kern_return_t test_deallocate(vm_map_t task, vm_address_t at, vm_size_t size) {
++    if (test_fail_release && at == 0x7000000000ull) return KERN_FAILURE;
++    return vm_deallocate(task, test_actual(at), size);
++}
++static kern_return_t test_protect(vm_map_t task, vm_address_t at, vm_size_t size, boolean_t maximum, vm_prot_t prot) {
++    return vm_protect(task, test_actual(at), size, maximum, prot);
++}
++#define vm_allocate test_allocate
++#define vm_deallocate test_deallocate
++#define vm_protect test_protect
++#define HENGE_EXPORT
++#define HENGE_LOG(...) do { fprintf(stderr, __VA_ARGS__); fputc(10, stderr); } while (0)
++#define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
++'''
++test = r'''
++int main(int argc, char **argv) {
++    REQUIRE(argc == 2);
++    REQUIRE(test_open_window() == KERN_SUCCESS);
++    henge_ios_hold_high();
++    for (int i = 0; i < 3; i++) REQUIRE(g_high_hold[i] == g_high_parts[i].at);
++    if (!strcmp(argv[1], "retry")) {
++        test_fail_release = 1;
++        henge_ios_jit_prepare_vm_memory();
++        REQUIRE(g_high_hold[0] == g_high_parts[0].at);
++        REQUIRE(g_high_hold[1] == 0 && g_high_hold[2] == 0);
++        test_fail_release = 0;
++        henge_ios_jit_prepare_vm_memory();
++        for (int i = 0; i < 3; i++) REQUIRE(g_high_hold[i] == 0);
++        puts("PASS: a failed release stays tracked and can be retried");
++        return 0;
++    }
++    if (!strcmp(argv[1], "claimed")) {
++        void *base[3]; size_t bytes[3];
++        REQUIRE(henge_ios_take_high_room(base, bytes) == 3);
++        henge_ios_jit_prepare_vm_memory();
++        vm_address_t p = (vm_address_t)(uintptr_t)base[0];
++        REQUIRE(vm_allocate(mach_task_self(), &p, 16384, VM_FLAGS_FIXED) == KERN_NO_SPACE);
++        REQUIRE(henge_ios_take_high_room(base, bytes) == 0);
++        puts("PASS: VM preparation preserves rooms already owned by a Mac app");
++        return 0;
++    }
++    /* The reported iPhone had only the 4 GiB gap between these holds left.
++       Runtime metadata consumes part of that gap after the Swift RAM probe. */
++    vm_address_t metadata = HENGE_JIT_VIEW_AT;
++    REQUIRE(vm_allocate(mach_task_self(), &metadata, 768ull << 20, VM_FLAGS_FIXED) == KERN_SUCCESS);
++    *(volatile unsigned char *)test_actual(metadata) = 0x5a;
++    vm_address_t ram = metadata + (768ull << 20);
++    REQUIRE(vm_allocate(mach_task_self(), &ram, 3584ull << 20, VM_FLAGS_FIXED) == KERN_NO_SPACE);
++    henge_ios_jit_prepare_vm_memory();
++    REQUIRE(*(volatile unsigned char *)test_actual(metadata) == 0x5a);
++    for (int i = 0; i < 3; i++) REQUIRE(g_high_hold[i] == 0);
++    ram = metadata + (768ull << 20);
++    REQUIRE(vm_allocate(mach_task_self(), &ram, 4096ull << 20, VM_FLAGS_FIXED) == KERN_SUCCESS);
++    *(volatile unsigned char *)test_actual(ram) = 0x34;
++    henge_ios_jit_prepare_vm_memory();
++    REQUIRE(*(volatile unsigned char *)test_actual(ram) == 0x34 && *(volatile unsigned char *)test_actual(metadata) == 0x5a);
++    REQUIRE(vm_deallocate(mach_task_self(), ram, 4096ull << 20) == KERN_SUCCESS);
++    REQUIRE(vm_deallocate(mach_task_self(), metadata, 768ull << 20) == KERN_SUCCESS);
++    puts("PASS: held-room allocation failure reproduced; release permits 4096 MiB RAM; live mappings survive repeat preparation");
++    return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix='henge-high-room-', dir='/private/tmp') as tmp:
++    path = Path(tmp)
++    (path / 'test.c').write_text(harness + reservation_code + test)
++    subprocess.run(['xcrun', '--sdk', sdk, 'clang', '-target', target, '-isysroot', sdk_path,
++                    '-Wall', '-Wextra', '-Werror', str(path / 'test.c'), '-o', str(path / 'test')], check=True)
++    for case in ['vm', 'claimed', 'retry']:
++        execute([str(path / 'test'), case])
++
++# Exercise the app's real Swift RAM sizing path with a controlled address probe.
++machines = (root / 'ios/Henge/Machines.swift').read_text()
++start = machines.index('enum GuestMemory {')
++end = machines.index('/// machine.json', start)
++swift = r'''import Foundation
++var held = true
++var preparations = 0
++func henge_ios_jit_prepare_vm_memory() { held = false; preparations += 1 }
++func henge_largest_mapping_mb() -> UInt64 {
++    precondition(!held, "unused reservations must be released before the RAM probe")
++    return 16896
++}
++struct VirtualMac { var directory: URL; var ramMB: Int }
++enum HengeLog { static func log(_ category: String, _ message: String) {} }
++''' + machines[start:end] + r'''
++let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
++defer { try? FileManager.default.removeItem(at: folder); unsetenv("HV_RAM_FILE") }
++precondition(GuestMemory.prepare(VirtualMac(directory: folder, ramMB: 4096)) == 4096)
++held = true
++precondition(GuestMemory.prepare(VirtualMac(directory: folder, ramMB: 2048)) == 2048)
++precondition(preparations == 2)
++precondition(String(cString: getenv("HV_RAM_FILE")) == folder.appendingPathComponent("ram.tmp").path)
++print("PASS: app releases unused rooms before sizing RAM; requested RAM and file path are preserved")
++'''
++with tempfile.TemporaryDirectory(prefix='henge-guest-memory-', dir='/private/tmp') as tmp:
++    path = Path(tmp)
++    (path / 'main.swift').write_text(swift)
++    subprocess.run(['xcrun', '--sdk', sdk, 'swiftc', '-swift-version', '5', '-target', target, '-sdk', sdk_path,
++                    '-module-cache-path', str(root / 'build/swift-module-cache'), str(path / 'main.swift'), '-o', str(path / 'test')], check=True)
++    execute([str(path / 'test')])
++print('JIT high address reservations: 4 cases, 0 failures')
++
+diff --git a/tests/test_vm_lifecycle.c b/tests/test_vm_lifecycle.c
+index f7148123..cf2edd6b 100644
+--- a/tests/test_vm_lifecycle.c
++++ b/tests/test_vm_lifecycle.c
+@@ -19,11 +19,24 @@ static HvJitRegion jit;
+ static HengeDualMapping mapping;
+ static int failures;
+ static _Atomic int reader_done;
+-HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
++static int memory_prepared, memory_preparations, installer_started;
++void henge_ios_jit_prepare_vm_memory(void) {
++    memory_prepared = 1;
++    memory_preparations++;
++}
++HengeDualMapping *henge_ios_jit_get_mapping(void) {
++    if (!memory_prepared) {
++        fprintf(stderr, "FAIL: native VM must release unused address reservations before using JIT\n");
++        failures++;
++    }
++    memory_prepared = 0;
++    return &mapping;
++}
+ void hv_prof_ios_start(void) {}
+ int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
+                      HvInstallProgress progress, void *user) {
+     (void)usb; (void)ipsw; (void)work; (void)ecid; (void)progress; (void)user;
++    installer_started++;
+     return -1;
+ }
+ static void check(const char *what, int ok) {
+@@ -203,8 +216,15 @@ int main(void) {
+     hv_vm_destroy();
+     atomic_store(&reader_done, 1);
+     pthread_join(reader, NULL);
++    int before_install = memory_preparations;
++    check("installer reaches restore after memory preparation",
++          henge_vm_install(rom, disk, aux, 1, "unused", dir, 64, 2, error, sizeof error) != 0
++          && installer_started == 1 && strstr(error, "installer could not start") != NULL);
++    check("installer prepares VM memory", memory_preparations == before_install + 1);
++    /* The installer stub owns no USB workers, so the test can release its board. */
++    hv_vm_destroy();
+     hv_jit_region_close(&jit);
+     unlink(rom); unlink(disk); unlink(aux); rmdir(dir);
+-    printf("VM lifecycle: 12 power cycles, 3 failed boots and a suspend/resume, %d failures\n", failures);
++    printf("VM lifecycle: 12 power cycles, 3 failed boots, suspend/resume and installer preflight, %d failures\n", failures);
+     return failures != 0;
+ }

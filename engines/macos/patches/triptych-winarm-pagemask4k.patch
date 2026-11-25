@@ -1,0 +1,118 @@
+From 81a2a7eb32fa7005b91dd73ea165faefe8ed0983 Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:28:03 -0500
+Subject: [PATCH] Page masks follow HV_TLB_PAGE_BITS: 4 KB TLB builds kept 16
+ KB masks in the TLBI race check (walk log), remote exec-page drops,
+ tlbi_may_hit and the JIT's aligned-access check. With 4 KB pages a walk
+ racing a multi-page TLBI could be judged elsewhere and leave a stale entry.
+ Alignment faults logged with the machine log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/cpu.h       | 2 ++
+ core/dispatch.c  | 4 ++--
+ core/exception.c | 6 ++++++
+ core/mmu.c       | 6 +++---
+ core/translate.c | 4 ++--
+ 5 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/core/cpu.h b/core/cpu.h
+index a6fca62..500dd11 100644
+--- a/core/cpu.h
++++ b/core/cpu.h
+@@ -33,6 +33,8 @@ static inline uint64_t hv_exec_key(uint64_t page_va, int64_t addend) {
+ #ifndef HV_TLB_PAGE_BITS
+ #define HV_TLB_PAGE_BITS 14 /* winarm builds with 12: Windows and EDK2 map 4 KB pages, which a 16 KB TLB entry cannot hold */
+ #endif
++/* A TLB page by the low 56 bits (tagged addresses), whatever HV_TLB_PAGE_BITS is. */
++#define HV_PAGE_BITS56 (0x00ffffffffffffffull & ~((1ull << HV_TLB_PAGE_BITS) - 1))
+ #define HV_TLB_ADJ 15
+ #define HV_TLB_INVALID 0x8080808080808080ull /* what memset(0x80) leaves */
+ #define HV_TLB_BITS 14 /* 16384 entries per EL: 256 MB of 16 KB pages (xnu's working set overflowed 64 MB) */
+diff --git a/core/dispatch.c b/core/dispatch.c
+index 1d05ff9..aa0fe69 100644
+--- a/core/dispatch.c
++++ b/core/dispatch.c
+@@ -447,11 +447,11 @@ static int tlbi_may_hit(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+     uint32_t op1 = (insn >> 16) & 7, crm = (insn >> 8) & 0xf, op2 = (insn >> 5) & 7;
+     int rt = insn & 0x1f;
+     uint64_t xt = rt == 31 ? 0 : cpu->x[rt];
+-    uint64_t page = pc & 0x00ffffffffffc000ull;
++    uint64_t page = pc & HV_PAGE_BITS56;
+     if (op1 != 0) return 1;
+     if ((crm == 1 || crm == 3 || crm == 7) && (op2 & 1)) { /* one page */
+         uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
+-        return (va & 0x00ffffffffffc000ull) == page;
++        return (va & HV_PAGE_BITS56) == page;
+     }
+     if ((crm == 2 || crm == 5 || crm == 6) && (op2 & 1)) { /* a range */
+         uint32_t tg = (xt >> 46) & 3;
+diff --git a/core/exception.c b/core/exception.c
+index 38cdb59..9fe222c 100644
+--- a/core/exception.c
++++ b/core/exception.c
+@@ -107,6 +107,12 @@ void hv_raise_abort(HvCpu *cpu, int insn, uint64_t va, uint32_t fsc, int wnr, in
+     uint32_t ec = insn ? (cpu->el ? HV_EC_IABT_SAME : HV_EC_IABT_LOWER)
+                        : (cpu->el ? HV_EC_DABT_SAME : HV_EC_DABT_LOWER);
+     uint32_t iss = fsc | (uint32_t)(wnr && !insn) << 6 | (uint32_t)s1ptw << 7;
++    if (cpu->m->log && fsc == HV_FSC_ALIGNMENT) {
++        uint32_t word = 0;
++        uint64_t pa;
++        if (!hv_mmu_access(cpu, pc, HV_ACC_EXEC, cpu->el, &pa)) hv_phys_read(cpu->m, pa, &word, 4);
++        fprintf(stderr, "alignment fault: pc %llx insn %08x va %llx el%u\n", (unsigned long long)pc, word, (unsigned long long)va, cpu->el);
++    }
+     hv_raise_sync(cpu, ec, iss, va, pc);
+ }
+ 
+diff --git a/core/mmu.c b/core/mmu.c
+index 232186c..9c27797 100644
+--- a/core/mmu.c
++++ b/core/mmu.c
+@@ -671,7 +671,7 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
+    HV_WALK_ANY: a process switch, which saves and restores many entries and the stashes. */
+ #define HV_WALK_ANY (~0ull)
+ #define WALK_LOG 8
+-#define WALK_PAGE_BITS 0x00ffffffffffc000ull /* by the low 56 bits, as drops compare tagged addresses */
++#define WALK_PAGE_BITS HV_PAGE_BITS56 /* by the low 56 bits, as drops compare tagged addresses */
+ 
+ static void walk_begin(HvCpu *cpu, uint64_t va) {
+     HvPerCpu *p = cpu->pc_state;
+@@ -750,7 +750,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
+     for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
+         HvTlbEntry *e = hv_tlb_ent(target, idx, t);
+         uint64_t x = __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED);
+-        if (x != HV_TLB_INVALID && ((hv_exec_key(x, e->addend) ^ va) & 0x00ffffffffffc000ull) == 0) fetched = 1;
++        if (x != HV_TLB_INVALID && ((hv_exec_key(x, e->addend) ^ va) & HV_PAGE_BITS56) == 0) fetched = 1;
+         __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+         __atomic_store_n(&e->write_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+         __atomic_store_n(&e->exec_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+@@ -791,7 +791,7 @@ int hv_tlbi_drop_remote_range(HvCpu *target, uint64_t va, uint64_t npages, int a
+             uint64_t x = __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED);
+             /* the slot whatever its tag, as for one page; fetched if it holds code from the range */
+             if (x != HV_TLB_INVALID) {
+-                uint64_t off = ((hv_exec_key(x, e->addend) & 0x00ffffffffffc000ull) - (va & 0x00ffffffffffc000ull)) & 0x00ffffffffffffffull;
++                uint64_t off = ((hv_exec_key(x, e->addend) & HV_PAGE_BITS56) - (va & HV_PAGE_BITS56)) & 0x00ffffffffffffffull;
+                 if (off < (npages << HV_TLB_PAGE_BITS)) fetched = 1;
+             }
+             __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+diff --git a/core/translate.c b/core/translate.c
+index 4722468..c558e87 100644
+--- a/core/translate.c
++++ b/core/translate.c
+@@ -1081,11 +1081,11 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+     put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
+     put(e, SUB_X(U, addr, U));
+     if (op.align && op.bytes > 1) {
+-        /* and U, U, #~(0x3fff & ~(bytes-1)) after taking the adjustment back off:
++        /* and U, U, #~(PAGE_MASK & ~(bytes-1)) after taking the adjustment back off:
+            zero only if same page and aligned */
+         uint32_t k = __builtin_ctz(op.bytes);
+         put(e, 0xd1000000u | HV_TLB_ADJ << 10 | U << 5 | U); /* sub U, U, #ADJ */
+-        put(e, 0x92400000u | 50u << 16 | (49u + k) << 10 | U << 5 | U);
++        put(e, 0x92400000u | (64u - HV_TLB_PAGE_BITS) << 16 | (63u - HV_TLB_PAGE_BITS + k) << 10 | U << 5 | U);
+     } else {
+         if (op.bytes > HV_TLB_ADJ + 1) put_add_imm(e, U, U, op.bytes - 1 - HV_TLB_ADJ);
+         put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
+-- 
+2.46.2
+

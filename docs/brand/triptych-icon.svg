@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="75%">
+      <stop offset="0" stop-color="#23264a"/>
+      <stop offset="0.6" stop-color="#121329"/>
+      <stop offset="1" stop-color="#07070f"/>
+    </radialGradient>
+    <linearGradient id="left" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4fd1ff"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="mid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f5f3ff"/>
+      <stop offset="0.55" stop-color="#c4b5fd"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="right" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#f97316"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <ellipse cx="512" cy="840" rx="360" ry="46" fill="#000" opacity="0.35"/>
+  <g filter="url(#shadow)">
+    <!-- left wing, folded toward the viewer -->
+    <path d="M196 300 L392 250 L392 774 L196 724 Z" fill="url(#left)"/>
+    <path d="M196 300 L392 250 L392 290 L196 336 Z" fill="#fff" opacity="0.18"/>
+    <!-- right wing -->
+    <path d="M828 300 L632 250 L632 774 L828 724 Z" fill="url(#right)"/>
+    <path d="M828 300 L632 250 L632 290 L828 336 Z" fill="#fff" opacity="0.18"/>
+    <!-- centre panel, arched top like an altarpiece -->
+    <path d="M412 250 L412 196 A100 100 0 0 1 612 196 L612 250 L612 774 L412 774 Z" fill="url(#mid)"/>
+  </g>
+  <!-- hinges -->
+  <rect x="396" y="250" width="12" height="524" rx="6" fill="#e0e7ff" opacity="0.85"/>
+  <rect x="616" y="250" width="12" height="524" rx="6" fill="#e0e7ff" opacity="0.85"/>
+  <circle cx="402" cy="512" r="40" fill="url(#glow)"/>
+  <circle cx="622" cy="512" r="40" fill="url(#glow)"/>
+  <!-- three panes on the centre panel -->
+  <g fill="#1e1b4b" opacity="0.82">
+    <rect x="452" y="360" width="120" height="16" rx="8"/>
+    <rect x="452" y="400" width="84" height="16" rx="8"/>
+    <rect x="452" y="440" width="104" height="16" rx="8"/>
+  </g>
+  <g fill="#ffffff" opacity="0.5">
+    <rect x="236" y="392" width="116" height="14" rx="7" transform="skewY(-14) translate(0 92)"/>
+    <rect x="672" y="392" width="116" height="14" rx="7" transform="skewY(14) translate(0 -190)"/>
+  </g>
+</svg>

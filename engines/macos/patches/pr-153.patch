@@ -1,0 +1,220 @@
+diff --git a/ios/Henge/Resources/henge-jit.js b/ios/Henge/Resources/henge-jit.js
+index b52ee7ec..9756cdf4 100644
+--- a/ios/Henge/Resources/henge-jit.js
++++ b/ios/Henge/Resources/henge-jit.js
+@@ -15,18 +15,48 @@ const legacyCommands = {
+ let tid, x0, x1, x16, pc;
+ 
+ let detached = false;
++// Set when the script stops without detaching. It is thrown at the end so StikJIT
++// reports an error to the caller instead of a clean detach.
++let failure = null;
+ let pid = get_pid();
+ log(`pid = ${pid}`);
+-let attachResponse = send_command(`vAttach;${pid.toString(16)}`);
++let attachResponse;
++try {
++    attachResponse = send_command(`vAttach;${pid.toString(16)}`);
++} catch (error) {
++    failure = `JIT_ATTACH_FAILED: debugserver connection closed while attaching: ${error}`;
++    log(failure);
++    detached = true;
++}
+ log(`attach_response = ${attachResponse}`);
+-    
++// vAttach must return a GDB stop packet. E96 (or any E.. reply) is
++// an attach refusal, not permission to send 'c'. Continuing after E96
++// caused "Socket(Custom { kind: NotConnected })" and a misleading success screen.
++if (!detached && (typeof attachResponse !== "string" || !/^T[0-9a-f]{2}/i.test(attachResponse))) {
++    failure = `JIT_ATTACH_FAILED: vAttach returned ${attachResponse}; JIT was NOT enabled. Check device pairing, Developer Disk Image, LocalDevVPN and debugger permissions, then retry.`;
++    log(failure);
++    detached = true;
++}
++
+ let totalBreakpoints = 0;
+ while (!detached) {
+     totalBreakpoints++;
+     log(`Handling breakpoint ${totalBreakpoints}`);
+     
+-    let brkResponse = send_command(`c`);
++    let brkResponse;
++    try {
++        brkResponse = send_command(`c`);
++    } catch (error) {
++        failure = `JIT_CONNECTION_LOST: debugserver disconnected: ${error}. JIT was NOT confirmed.`;
++        log(failure);
++        break;
++    }
+     log(`brkResponse = ${brkResponse}`);
++    if (typeof brkResponse !== "string" || !/^T[0-9a-f]{2}/i.test(brkResponse)) {
++        failure = `JIT_CONNECTION_LOST: expected a stop packet but received ${brkResponse}; stopping instead of sending more commands.`;
++        log(failure);
++        break;
++    }
+     
+     let tmpMatch = /T[0-9a-f]+thread:(?<tid>[0-9a-f]+);/.exec(brkResponse);
+     tid = tmpMatch ? tmpMatch.groups['tid'] : null;
+@@ -35,8 +65,9 @@ while (!detached) {
+     tmpMatch = /10:(?<reg>[0-9a-f]{16});/.exec(brkResponse);
+     x16 = tmpMatch ? tmpMatch.groups['reg'] : null;
+     if (!tid || !pc || !x16) {
+-        log(`Failed to extract registers: tid=${tid}, pc=${pc}, x16=${x16}`);
+-        continue;
++        failure = `Failed to extract registers: tid=${tid}, pc=${pc}, x16=${x16}; stopping to avoid an invalid debugger command.`;
++        log(failure);
++        break;
+     }
+     pc = littleEndianHexStringToNumber(pc);
+     x16 = littleEndianHexStringToNumber(x16);
+@@ -53,8 +84,9 @@ while (!detached) {
+         tmpMatch = /01:(?<reg>[0-9a-f]{16});/.exec(brkResponse);
+         x1 = tmpMatch ? tmpMatch.groups['reg'] : null;
+         if (!x0 || !x1) {
+-            log(`Failed to extract registers: x0=${x0}, x1=${x1}`);
+-            continue;
++            failure = `Failed to extract registers: x0=${x0}, x1=${x1}; stopping to avoid an invalid debugger command.`;
++            log(failure);
++            break;
+         }
+         x0 = littleEndianHexStringToNumber(x0);
+         x1 = littleEndianHexStringToNumber(x1);
+@@ -73,6 +105,10 @@ while (!detached) {
+     }
+ }
+ 
++if (failure) {
++    throw new Error(failure);
++}
++
+ function JIT26Detach() {
+     let detachResponse = send_command(`D`);
+     log(`detachResponse = ${detachResponse}`);
+@@ -102,7 +138,7 @@ function JIT26NewBreakpoints(brkResponse) {
+ 
+ // brk 0x69
+ function JIT26HandleBrk0x69(brkResponse) {
+-    let putX0Response = send_command(`P0=E0000069;thread:${tid};`);
++    let putX0Response = send_command(`P0=${numberToLittleEndianHexString(0x690000E0n)};thread:${tid};`);
+     log(`putX0Response = ${putX0Response}`);
+ }
+ 
+@@ -151,26 +187,27 @@ function JIT26PrepareRegion(brkResponse) {
+ 
+ // utilities
+ function littleEndianHexStringToNumber(hexStr) {
++    if (!/^[0-9a-f]{16}$/i.test(hexStr)) {
++        throw new Error(`Invalid 64-bit register: ${hexStr}`);
++    }
+     const bytes = [];
+     for (let i = 0; i < hexStr.length; i += 2) {
+-        bytes.push(parseInt(hexStr.substr(i, 2), 16));
++        bytes.push(parseInt(hexStr.slice(i, i + 2), 16));
+     }
+     let num = 0n;
+-    for (let i = 4; i >= 0; i--) {
++    for (let i = 7; i >= 0; i--) {
+         num = (num << 8n) | BigInt(bytes[i]);
+     }
+     return num;
+ }
+ 
+ function numberToLittleEndianHexString(num) {
++    num = BigInt.asUintN(64, num);
+     const bytes = [];
+-    for (let i = 0; i < 5; i++) {
++    for (let i = 0; i < 8; i++) {
+         bytes.push(Number(num & 0xFFn));
+         num >>= 8n;
+     }
+-    while (bytes.length < 8) {
+-        bytes.push(0);
+-    }
+     return bytes.map(b => b.toString(16).padStart(2, '0')).join('');
+ }
+ 
+diff --git a/tests/test_henge_jit_script.js b/tests/test_henge_jit_script.js
+new file mode 100644
+index 00000000..ec8fad99
+--- /dev/null
++++ b/tests/test_henge_jit_script.js
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Offline protocol regressions for the script sent to StikDebug and StikJIT.
++// Run: node tests/test_henge_jit_script.js
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++const vm = require("node:vm");
++
++const script = fs.readFileSync(
++  path.join(__dirname, "../ios/Henge/Resources/henge-jit.js"), "utf8"
++);
++
++function run(send) {
++  const commands = [];
++  const messages = [];
++  let thrown = null;
++  try {
++  vm.runInNewContext(script, {
++    get_pid: () => 1599,
++    send_command: command => {
++      commands.push(command);
++      return send(command, commands);
++    },
++    log: (...parts) => messages.push(parts.map(String).join(" ")),
++    prepare_memory_region: () => true
++  }, { timeout: 1000 });
++  } catch (error) {
++    thrown = error;
++  }
++  return { commands, messages, thrown };
++}
++
++{
++  const { commands, messages, thrown } = run(() => "E96");
++  assert.deepEqual(commands, ["vAttach;63f"],
++    "Must not continue a socket after vAttach refused the PID");
++  assert(messages.some(line => line.includes("JIT_ATTACH_FAILED") && line.includes("E96")));
++  assert(thrown && /JIT_ATTACH_FAILED/.test(thrown.message),
++    "A refused attach must throw so the helper reports a failure, not a clean detach");
++}
++{
++  const { commands, messages, thrown } = run(command => {
++    if (command.startsWith("vAttach")) return "T05thread:1;";
++    throw new Error("Socket NotConnected");
++  });
++  assert(thrown && /JIT_CONNECTION_LOST/.test(thrown.message), "A lost debugserver must throw");
++  assert.deepEqual(commands, ["vAttach;63f", "c"]);
++  assert(messages.some(line => line.includes("JIT_CONNECTION_LOST")));
++}
++{
++  const stop = "T05thread:1;20:bc9a785634120000;10:0000000000000000;" +
++    "00:0000000000000000;01:0000000000000000;";
++  const { commands, messages, thrown } = run((command, calls) => {
++    if (command.startsWith("vAttach")) return "T05thread:1;";
++    if (command === "c") return calls.filter(x => x === "c").length === 1 ? stop : "E96";
++    if (command.startsWith("m")) return "200d20d4"; // brk #0x69
++    return "OK";
++  });
++  assert(commands.includes("m123456789abc,4"), "PC cannot be truncated to 40 bits");
++  assert(commands.includes("P20=c09a785634120000;thread:1;"), "PC+4 must be 64-bit");
++  assert(commands.includes("P0=e000006900000000;thread:1;"), "x0 must be 64-bit");
++  assert(messages.some(line => line.includes("expected a stop packet")));
++  assert(thrown && /expected a stop packet/.test(thrown.message));
++}
++
++{
++  // A clean run (attach, one brk #0xf00d detach) must not throw.
++  const stop = "T05thread:1;20:bc9a785634120000;10:0000000000000000;" +
++    "00:0000000000000000;01:0000000000000000;";
++  const { commands, thrown } = run(command => {
++    if (command.startsWith("vAttach")) return "T05thread:1;";
++    if (command === "c") return stop;
++    if (command.startsWith("m")) return "a0013ed4"; // brk #0xf00d, x16 = 0: detach
++    return "OK";
++  });
++  assert.equal(thrown, null, "A clean detach must not throw");
++  assert(commands.includes("D"));
++}
++
++console.log("PASS: refused attach, lost socket, 64-bit registers, clean detach");

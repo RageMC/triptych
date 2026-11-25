@@ -1,0 +1,149 @@
+From 94c7e4faa1894430a04278923d394e9266ed1168 Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:18:34 -0500
+Subject: [PATCH] mmu: a TLBI by VA drops the whole block an entry came from
+
+Block (2 MB/1 GB) and Contiguous mappings are cached as separate pages, but a
+TLBI by VA removes the whole TLB entry on hardware. Windows changes or splits a
+2 MB mapping with one TLBI of its address, so the other 511 pages stayed stale:
+random KERNEL_MODE_HEAP_CORRUPTION in WinPE (1 CPU ~30%, 4 CPUs ~12% of boots;
+0/55 with this). Regions holding such entries are marked per CPU (hashed); a
+TLBI by VA or range in one drops the region, and a broadcast one is posted to
+CPUs that hold such pages. HV_NO_TLBI_BLOCK=1 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/machine.h |  3 +++
+ core/mmu.c     | 19 +++++++++++++++++++
+ core/mmu.h     |  2 ++
+ core/sysreg.c  | 22 ++++++++++++++++++++++
+ 4 files changed, 46 insertions(+)
+
+diff --git a/core/machine.h b/core/machine.h
+index 208cdc3..8e6e582 100644
+--- a/core/machine.h
++++ b/core/machine.h
+@@ -212,6 +212,9 @@ typedef struct HvPerCpu {
+     uint8_t phase;               /* for --stats, what a CPU others wait on is doing: HV_PHASE_* */
+     HvTlbStash stash[HV_STASHES];
+     uint64_t stash_clock;
++    /* Regions with TLB entries filled from a block (or Contiguous) descriptor, hashed: 2 MB ones by VA[32:21], 1 GB
++       ones by VA[35:30]. A TLBI by VA drops such an entry's whole block on hardware (hv_tlb_block_span). */
++    uint64_t blk2m[64], blk1g;
+ } HvPerCpu;
+ 
+ enum { HV_PHASE_RUN, HV_PHASE_TRANSLATE, HV_PHASE_HELPER, HV_PHASE_SYNC, HV_PHASE_FLUSH };
+diff --git a/core/mmu.c b/core/mmu.c
+index 9c27797..c11560a 100644
+--- a/core/mmu.c
++++ b/core/mmu.c
+@@ -108,6 +108,7 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
+         }
+         uint64_t size = 1ull << shift;
+         out->block_size = size;
++        out->contig = (desc >> 52) & 1;
+         out->pa = (desc & OA_MASK & ~(size - 1)) | (va & (size - 1));
+         out->attr = (cpu->mair_el1 >> (((desc >> 2) & 7) * 8)) & 0xff;
+         if (!(desc & (1u << 10))) {
+@@ -163,6 +164,7 @@ void hv_tlb_flush(HvCpu *cpu) {
+     cpu->nuser_fills = 0;
+     cpu->nkernel_fills = 0;
+     hv_tlb_stash_drop(cpu, -1);
++    if (cpu->pc_state) memset(cpu->pc_state->blk2m, 0, sizeof cpu->pc_state->blk2m), cpu->pc_state->blk1g = 0;
+ }
+ 
+ /* Clear the tables of one half (user tables are the even flags values, kernel ones odd). */
+@@ -662,6 +664,23 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
+     if (cpu->m->watch_pa && (cpu->m->watch_pa & ~PAGE_MASK) == page_pa) e->write_tag = HV_TLB_INVALID;
+     e->exec_tag = w->x ? hv_exec_key(page_va, e->addend) : HV_TLB_INVALID;
+     if (e->write_tag != HV_TLB_INVALID) write_guard(cpu, ram, pg, hv_tlb_code(slot, table), e);
++    if (cpu->pc_state && (w->block_size > (1ull << HV_TLB_PAGE_BITS) || w->contig)) {
++        if (w->block_size >= (1ull << 30)) __atomic_or_fetch(&cpu->pc_state->blk1g, 1ull << ((va >> 30) & 63), __ATOMIC_RELAXED);
++        else __atomic_or_fetch(&cpu->pc_state->blk2m[(va >> 27) & 63], 1ull << ((va >> 21) & 63), __ATOMIC_RELAXED);
++    }
++}
++
++/* A TLBI by VA removes the whole TLB entry holding the VA; for a block (or Contiguous run) mapped here as
++   separate pages, that is every page of it. Windows changes or splits a 2 MB mapping with one TLBI of its
++   address. Returns the region to drop (1 GB, 2 MB, or 0: just the page); the marks may say yes falsely. */
++uint64_t hv_tlb_block_span(HvCpu *cpu, uint64_t va) {
++    HvPerCpu *p = cpu->pc_state;
++    static int off = -1;
++    if (off < 0) off = getenv("HV_NO_TLBI_BLOCK") != NULL;
++    if (!p || off || HV_TLB_PAGE_BITS >= 21) return 0;
++    if (__atomic_load_n(&p->blk1g, __ATOMIC_RELAXED) >> ((va >> 30) & 63) & 1) return 1ull << 30;
++    if (__atomic_load_n(&p->blk2m[(va >> 27) & 63], __ATOMIC_RELAXED) >> ((va >> 21) & 63) & 1) return 1ull << 21;
++    return 0;
+ }
+ 
+ /* Walks that may fill the TLB are bracketed by the CPU's walk_seq (odd while
+diff --git a/core/mmu.h b/core/mmu.h
+index 0f9bbf8..81ad2e2 100644
+--- a/core/mmu.h
++++ b/core/mmu.h
+@@ -18,6 +18,7 @@ typedef struct HvWalk {
+     uint64_t block_size; /* size of the mapping that was found */
+     uint8_t r, w, x;     /* permissions at the EL that was asked about */
+     uint8_t attr;        /* MAIR attribute byte */
++    uint8_t contig;      /* the descriptor's Contiguous bit */
+ } HvWalk;
+ 
+ /* Fault status codes (ESR ISS DFSC/IFSC). */
+@@ -38,6 +39,7 @@ void hv_kva_hist_dump(FILE *f); /* HV_KVA_HIST, see mmu.c */
+ /* A big range of kernel VAs: its kernel entries and cached branch targets, not every process's entries. */
+ void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len);
+ void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len);
++uint64_t hv_tlb_block_span(HvCpu *cpu, uint64_t va);
+ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old_ttbr0, uint64_t new_ttbr0); /* a process switch */
+ void hv_tlb_stash_drop(HvCpu *cpu, int asid); /* asid -1: all */
+ /* Empty the indirect-branch cache for all user (0) or for kernel (1) VAs. */
+diff --git a/core/sysreg.c b/core/sysreg.c
+index 4fbc3e2..215be19 100644
+--- a/core/sysreg.c
++++ b/core/sysreg.c
+@@ -459,6 +459,16 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
+             uint64_t first = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+             for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS)
+                 hv_tlb_flush_va_asid(cpu, p, all_asids ? -1 : (int)(xt >> 48));
++            uint64_t s1 = hv_tlb_block_span(cpu, va), s2 = hv_tlb_block_span(cpu, va + len - 1), span = s1 > s2 ? s1 : s2;
++            if (span) { /* a block at either end: all of the blocks the range touches */
++                uint64_t b0 = va & ~(span - 1), b1 = (va + len + span - 1) & ~(span - 1);
++                if ((va >> 55) & 1) hv_tlb_flush_kernel_range(cpu, b0, b1 - b0);
++                else {
++                    hv_tlb_flush_user_range(cpu, b0, b1 - b0);
++                    hv_tlb_stash_drop(cpu, all_asids ? -1 : (int)(xt >> 48));
++                    hv_ijc_drop_range(cpu, b0, b1 - b0, all_asids ? -1 : (int)(xt >> 48));
++                }
++            }
+         }
+         return;
+     }
+@@ -466,6 +476,16 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
+         uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
+         int all_asids = op2 == 3 || op2 == 7; /* VAAE1, VAALE1 */
+         hv_tlb_flush_va_page(cpu, va, all_asids ? -1 : (int)(xt >> 48));
++        uint64_t span = hv_tlb_block_span(cpu, va);
++        if (span) { /* the entry was (part of) a block: all of it goes */
++            uint64_t b0 = va & ~(span - 1);
++            if ((va >> 55) & 1) hv_tlb_flush_kernel_range(cpu, b0, span);
++            else {
++                hv_tlb_flush_user_range(cpu, b0, span);
++                hv_tlb_stash_drop(cpu, all_asids ? -1 : (int)(xt >> 48));
++                hv_ijc_drop_range(cpu, b0, span, all_asids ? -1 : (int)(xt >> 48));
++            }
++        }
+     } else if (by_asid) {
+         hv_tlb_flush_user(cpu);
+         hv_tlb_stash_drop(cpu, (int)(xt >> 48));
+@@ -604,6 +624,8 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+                    A drop that raced a page walk or cache fill of c's (they are
+                    short) is tried again a few times first. */
+                 int done = npages > 0, why = !npages ? (by_range ? 1 : 2) : 0;
++                if (done && (hv_tlb_block_span(c, va) || (npages > 1 && hv_tlb_block_span(c, va + (npages << HV_TLB_PAGE_BITS) - 1))))
++                    done = 0, why = 2; /* c holds pages of a block there: it drops the whole block itself */
+                 if (done && npages > 1 && hv_knob[HV_K_RANGEDROP] > 0) {
+                     int r = 0;
+                     for (int t = 0; t < 4 && (r = hv_tlbi_drop_remote_range(c, va, npages, asid)) == 0; t++)
+-- 
+2.46.2
+

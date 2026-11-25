@@ -1,0 +1,437 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		249679F8A8AF198ECCB73CD9 /* HostViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 30382813B28D62CF376BC7F6 /* HostViewController.m */; };
+		4D094187059D15A1A35D9AEF /* MacAppHostUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BDCAA86F3E081BF05B73E8F /* MacAppHostUITests.swift */; };
+		5BEE569E9ABF93DB098F998A /* SceneDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 51B8DE9CDF48EF2FF1671A6A /* SceneDelegate.m */; };
+		77AF879B29F7FF6C55D00430 /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = FD5BA64B048FA0490A393B2B /* AppDelegate.m */; };
+		99BDB28466B5B06150A4B996 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 13DEEBFBAA43D5066E395482 /* main.m */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		86ABC57432AC5EB153B6D6F9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = DE33D062FFDFFED043E15601 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0EE1285908486046FC78A94B;
+			remoteInfo = MacAppHost;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		13DEEBFBAA43D5066E395482 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
+		2BDCAA86F3E081BF05B73E8F /* MacAppHostUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacAppHostUITests.swift; sourceTree = "<group>"; };
+		30382813B28D62CF376BC7F6 /* HostViewController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = HostViewController.m; sourceTree = "<group>"; };
+		51B8DE9CDF48EF2FF1671A6A /* SceneDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SceneDelegate.m; sourceTree = "<group>"; };
+		6857220ABEBEEE9090D1EF36 /* MacAppHost.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = MacAppHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		91E6E1EFAE2BC27EACDD6125 /* MacAppHostUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MacAppHostUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		FD5BA64B048FA0490A393B2B /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		0064B9A8AB9A6A1B033FB782 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				6857220ABEBEEE9090D1EF36 /* MacAppHost.app */,
+				91E6E1EFAE2BC27EACDD6125 /* MacAppHostUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		2E3C21D868487590C07E2B24 /* MacAppHost */ = {
+			isa = PBXGroup;
+			children = (
+				FD5BA64B048FA0490A393B2B /* AppDelegate.m */,
+				30382813B28D62CF376BC7F6 /* HostViewController.m */,
+				13DEEBFBAA43D5066E395482 /* main.m */,
+				51B8DE9CDF48EF2FF1671A6A /* SceneDelegate.m */,
+			);
+			path = MacAppHost;
+			sourceTree = "<group>";
+		};
+		7286FFF392A98D45F96042D3 /* MacAppHostUITests */ = {
+			isa = PBXGroup;
+			children = (
+				2BDCAA86F3E081BF05B73E8F /* MacAppHostUITests.swift */,
+			);
+			path = MacAppHostUITests;
+			sourceTree = "<group>";
+		};
+		8928C5F55732A2B98DC30760 = {
+			isa = PBXGroup;
+			children = (
+				2E3C21D868487590C07E2B24 /* MacAppHost */,
+				7286FFF392A98D45F96042D3 /* MacAppHostUITests */,
+				0064B9A8AB9A6A1B033FB782 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		0EE1285908486046FC78A94B /* MacAppHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D7B0E552672D985E9AB387E0 /* Build configuration list for PBXNativeTarget "MacAppHost" */;
+			buildPhases = (
+				5E9DECFBD77A3D19C13376D9 /* Sources */,
+				01F1771976B4D8447E3DB9B3 /* Build and Embed Retagged TestMacApp and libShim_AppKit */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MacAppHost;
+			packageProductDependencies = (
+			);
+			productName = MacAppHost;
+			productReference = 6857220ABEBEEE9090D1EF36 /* MacAppHost.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A4D8FA434F624E298DB3BD28 /* MacAppHostUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 023F86BDA79A914D24F9A78D /* Build configuration list for PBXNativeTarget "MacAppHostUITests" */;
+			buildPhases = (
+				B60B5A25D7853CE5D0EDAD5B /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1B1896B1FE0853B04BFDF788 /* PBXTargetDependency */,
+			);
+			name = MacAppHostUITests;
+			packageProductDependencies = (
+			);
+			productName = MacAppHostUITests;
+			productReference = 91E6E1EFAE2BC27EACDD6125 /* MacAppHostUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		DE33D062FFDFFED043E15601 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					0EE1285908486046FC78A94B = {
+						ProvisioningStyle = Automatic;
+					};
+					A4D8FA434F624E298DB3BD28 = {
+						ProvisioningStyle = Automatic;
+						TestTargetID = 0EE1285908486046FC78A94B;
+					};
+				};
+			};
+			buildConfigurationList = 0370E56DD4E928D1A47BE87F /* Build configuration list for PBXProject "MacAppHost" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 8928C5F55732A2B98DC30760;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 0064B9A8AB9A6A1B033FB782 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				0EE1285908486046FC78A94B /* MacAppHost */,
+				A4D8FA434F624E298DB3BD28 /* MacAppHostUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		01F1771976B4D8447E3DB9B3 /* Build and Embed Retagged TestMacApp and libShim_AppKit */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build and Embed Retagged TestMacApp and libShim_AppKit";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nHOST_ROOT=\"$SRCROOT\"\nSTAGE=\"$TARGET_TEMP_DIR/macapps-stage\"\nrm -rf \"$STAGE\"\nmkdir -p \"$STAGE/MacTest.app/Contents/MacOS\" \"$STAGE/MacTest.app/Contents/Resources\"\n\n# 1. Build retag for the Mac host (strip iOS build env vars first).\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk macosx clang -Wall -Wextra -O2 \\\n  \"$HOST_ROOT/retag/retag.c\" -o \"$STAGE/retag\"\n\n# 2. Build TestMacApp strictly against macOS arm64 SDK.\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk macosx clang -fobjc-arc -arch arm64 -mmacosx-version-min=14.0 \\\n  -framework AppKit -framework Metal -framework QuartzCore -framework Foundation \\\n  \"$HOST_ROOT/testapp/main.m\" -o \"$STAGE/MacTest.app/Contents/MacOS/TestMacApp\"\n\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk macosx metal \\\n  \"$HOST_ROOT/testapp/triangle.metal\" -o \"$STAGE/MacTest.app/Contents/Resources/testapp.metallib\"\n\n# 3. Build libShim_AppKit.dylib for the active iOS platform (simulator or device).\nif [ \"$PLATFORM_NAME\" = \"iphonesimulator\" ]; then\n  SHIM_SDK=\"iphonesimulator\"\n  SHIM_TARGET=\"arm64-apple-ios17.0-simulator\"\n  RETAG_PLATFORM=\"iossim\"\nelse\n  SHIM_SDK=\"iphoneos\"\n  SHIM_TARGET=\"arm64-apple-ios17.0\"\n  RETAG_PLATFORM=\"ios\"\nfi\n\nAPP_DIR=\"$TARGET_BUILD_DIR/$WRAPPER_NAME\"\nFW_DIR=\"$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH\"\nGUEST_DIR=\"$APP_DIR/MacGuest\"\nmkdir -p \"$FW_DIR\" \"$GUEST_DIR/Contents/MacOS\" \"$GUEST_DIR/Contents/Resources\"\n\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk \"$SHIM_SDK\" clang -Wall -Wextra -fobjc-arc \\\n  -target \"$SHIM_TARGET\" -dynamiclib \\\n  -install_name @rpath/libShim_AppKit.dylib \\\n  -Wl,-reexport_framework,UIKit \\\n  -framework Foundation -framework QuartzCore -framework CoreGraphics -framework Metal \\\n  \"$HOST_ROOT/shim/libShim_AppKit.m\" \"$HOST_ROOT/shim/libShim_Nib.m\" -o \"$FW_DIR/libShim_AppKit.dylib\"\n\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk \"$SHIM_SDK\" clang -Wall -Wextra -fobjc-arc \\\n  -target \"$SHIM_TARGET\" -dynamiclib \\\n  -install_name @rpath/libShim_MacShims.dylib \\\n  -Wl,-reexport_framework,CoreFoundation \\\n  -Wl,-reexport_framework,Foundation \\\n  -Wl,-reexport_framework,CoreGraphics \\\n  -Wl,-reexport_framework,CoreServices \\\n  -Wl,-reexport_framework,Security \\\n  -Wl,-reexport_framework,SystemConfiguration \\\n  -Wl,-reexport_framework,IOKit \\\n  -framework UIKit \\\n  \"$HOST_ROOT/shim/libShim_MacShims.m\" -o \"$FW_DIR/libShim_MacShims.dylib\"\n\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk \"$SHIM_SDK\" swiftc -c \\\n  -target \"$SHIM_TARGET\" \\\n  -module-name ShimSUI \\\n  -parse-as-library \\\n  -enable-library-evolution \\\n  -import-objc-header \"$HOST_ROOT/shim/libShim_SwiftUI_Bridge.h\" \\\n  \"$HOST_ROOT/shim/libShim_SwiftUI.swift\" \\\n  -o \"$STAGE/libShim_SwiftUI.o\"\n/usr/bin/python3 \"$HOST_ROOT/shim/gen_swiftui_aliases.py\" \\\n  \"$STAGE/libShim_SwiftUI.o\" \"$STAGE/swiftui_aliases.txt\"\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk \"$SHIM_SDK\" swiftc \\\n  -target \"$SHIM_TARGET\" \\\n  -emit-library \\\n  -o \"$FW_DIR/libShim_SwiftUI.dylib\" \\\n  \"$STAGE/libShim_SwiftUI.o\" \\\n  \"$FW_DIR/libShim_AppKit.dylib\" \\\n  -framework SwiftUI -framework UIKit -framework Foundation \\\n  -Xlinker -install_name -Xlinker @rpath/libShim_SwiftUI.dylib \\\n  -Xlinker -reexport_framework -Xlinker SwiftUI \\\n  -Xlinker -alias_list -Xlinker \"$STAGE/swiftui_aliases.txt\"\n\nSHIM_SDK_PATH=\"$(/usr/bin/xcrun --sdk \"$SHIM_SDK\" --show-sdk-path)\"\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk \"$SHIM_SDK\" clang -Wall -Wextra \\\n  -target \"$SHIM_TARGET\" -dynamiclib \\\n  -install_name @rpath/libShim_swiftCore.dylib \\\n  -L\"$SHIM_SDK_PATH/usr/lib/swift\" -Wl,-reexport-lswiftCore \\\n  \"$HOST_ROOT/shim/libShim_swiftCore.c\" -o \"$FW_DIR/libShim_swiftCore.dylib\"\n\n# Thin 1-to-1 re-export shims so Mach-O library ordinals never shift when retagging.\nprintf 'void _shim_reexport_anchor(void) {}\\n' > \"$STAGE/reexport.c\"\nenv -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n  /usr/bin/xcrun -sdk \"$SHIM_SDK\" clang -target \"$SHIM_TARGET\" -dynamiclib \\\n  -install_name @rpath/libShim_Cocoa.dylib \\\n  -Wl,-reexport_library,\"$FW_DIR/libShim_AppKit.dylib\" \\\n  \"$STAGE/reexport.c\" -o \"$FW_DIR/libShim_Cocoa.dylib\"\nfor SHIM_FW in CoreFoundation Foundation CoreGraphics CoreServices Security SecurityFoundation DiskArbitration ServiceManagement SystemConfiguration IOKit; do\n  env -u SDKROOT -u PLATFORM_NAME -u IPHONEOS_DEPLOYMENT_TARGET -u ARCHS \\\n    /usr/bin/xcrun -sdk \"$SHIM_SDK\" clang -target \"$SHIM_TARGET\" -dynamiclib \\\n    -install_name \"@rpath/libShim_${SHIM_FW}.dylib\" \\\n    -Wl,-reexport_library,\"$FW_DIR/libShim_MacShims.dylib\" \\\n    \"$STAGE/reexport.c\" -o \"$FW_DIR/libShim_${SHIM_FW}.dylib\"\ndone\n\n# 4. Retag TestMacApp to target iOS/Simulator, shrink __PAGEZERO, convert MH_EXECUTE -> MH_DYLIB,\n#    rewrite AppKit -> @rpath/libShim_AppKit.dylib, and ad-hoc sign.\n\"$STAGE/retag\" \\\n  --platform \"$RETAG_PLATFORM\" \\\n  --minos 17.0 \\\n  --sdk 27.2 \\\n  --rewrite-deps \\\n  --add-rpath @executable_path/Frameworks \\\n  --no-sign \\\n  \"$STAGE/MacTest.app/Contents/MacOS/TestMacApp\" \\\n  -o \"$GUEST_DIR/Contents/MacOS/TestMacApp\"\n\ncp \"$STAGE/MacTest.app/Contents/Resources/testapp.metallib\" \"$GUEST_DIR/Contents/Resources/testapp.metallib\"\n\nSIGN_ID=\"${EXPANDED_CODE_SIGN_IDENTITY:-}\"\nif [ -z \"$SIGN_ID\" ] || [ \"${CODE_SIGNING_ALLOWED:-NO}\" = \"NO\" ]; then\n  SIGN_ID=\"-\"\nfi\nfor DYLIB in \"$FW_DIR\"/libShim_*.dylib; do\n  /usr/bin/codesign --force --sign \"$SIGN_ID\" --timestamp=none \"$DYLIB\"\ndone\n/usr/bin/codesign --force --sign \"$SIGN_ID\" --timestamp=none \"$GUEST_DIR/Contents/MacOS/TestMacApp\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		5E9DECFBD77A3D19C13376D9 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				77AF879B29F7FF6C55D00430 /* AppDelegate.m in Sources */,
+				249679F8A8AF198ECCB73CD9 /* HostViewController.m in Sources */,
+				5BEE569E9ABF93DB098F998A /* SceneDelegate.m in Sources */,
+				99BDB28466B5B06150A4B996 /* main.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B60B5A25D7853CE5D0EDAD5B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4D094187059D15A1A35D9AEF /* MacAppHostUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		1B1896B1FE0853B04BFDF788 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0EE1285908486046FC78A94B /* MacAppHost */;
+			targetProxy = 86ABC57432AC5EB153B6D6F9 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		1FA15CB81D092ECB2E487565 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_BITCODE = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		3F98CBFE58CB652A2FF63951 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = MacAppHost/MacAppHost.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_DEBUG_DYLIB = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MacAppHost/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = app.triptych.MacAppHost;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		9C3900D5D6399310EA8564B7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = app.triptych.MacAppHostUITests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = MacAppHost;
+			};
+			name = Release;
+		};
+		D5535C02330247B6CA763B73 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_BITCODE = NO;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		ECFF3ACDD2250A696B60324B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = app.triptych.MacAppHostUITests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = MacAppHost;
+			};
+			name = Debug;
+		};
+		EF3CBB62313286AE21FA615D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = MacAppHost/MacAppHost.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_DEBUG_DYLIB = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MacAppHost/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = app.triptych.MacAppHost;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		023F86BDA79A914D24F9A78D /* Build configuration list for PBXNativeTarget "MacAppHostUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				ECFF3ACDD2250A696B60324B /* Debug */,
+				9C3900D5D6399310EA8564B7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		0370E56DD4E928D1A47BE87F /* Build configuration list for PBXProject "MacAppHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1FA15CB81D092ECB2E487565 /* Debug */,
+				D5535C02330247B6CA763B73 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		D7B0E552672D985E9AB387E0 /* Build configuration list for PBXNativeTarget "MacAppHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EF3CBB62313286AE21FA615D /* Debug */,
+				3F98CBFE58CB652A2FF63951 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = DE33D062FFDFFED043E15601 /* Project object */;
+}

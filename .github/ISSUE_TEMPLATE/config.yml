@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: In-App Curator Report (Recommended)
+    url: https://github.com/RageMC/triptych-issues/issues
+    about: Use Curator inside Triptych to automatically triage, scrub logs, and submit diagnostic reports to RageMC/triptych-issues.
+  - name: Security Vulnerability
+    url: https://github.com/RageMC/triptych/security/advisories/new
+    about: Report security or log-scrubbing vulnerabilities privately via GitHub Security Advisories.

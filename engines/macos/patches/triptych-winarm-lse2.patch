@@ -1,0 +1,72 @@
+From b321c9a09c77245551465e08072738ad6aa72404 Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:58:30 -0500
+Subject: [PATCH] FEAT_LSE2 for winarm (unaligned LDAR/STLR within 16 bytes,
+ MMFR2.AT); a misaligned access no longer loops in hv_tlb_refill
+
+Windows on Arm's clock interrupt writes KUSER_SHARED_DATA.SystemTime at +0x14 with an 8-byte STLR. The JIT's alignment check missed, hv_tlb_refill reported success, and the vCPU retried the store forever, so interrupt time never advanced.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/machine.h | 1 +
+ core/memop.c   | 4 +++-
+ core/mmu.c     | 3 +++
+ core/sysreg.c  | 1 +
+ 4 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/core/machine.h b/core/machine.h
+index 0a93e6c..208cdc3 100644
+--- a/core/machine.h
++++ b/core/machine.h
+@@ -249,6 +249,7 @@ typedef struct HvMachine {
+     int gen_checks;
+     int trace;           /* print every block entered */
+     int pmu_regs;        /* PMEVCNTR/PMEVTYPER/PMCCFILTR (CRn 14, CRm 8..15) as RAZ/WI: Windows' boot loader writes them whether or not a PMU is advertised */
++    int lse2;            /* FEAT_LSE2: LDAR/STLR/LDAPR/STLUR may be unaligned within 16 bytes (winarm: Windows writes KUSER_SHARED_DATA.SystemTime at +0x14 with STLR) */
+     int hafdbs;          /* FEAT_HAFDBS, Access flag only (winarm: Windows on Arm needs it); macOS guests keep it off */
+     int psci_smc;        /* PSCI over SMC too (EDK2 + Windows on the winarm board: no EL3, so the HVC handler answers) */
+     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
+diff --git a/core/memop.c b/core/memop.c
+index ae4cfee..c8a07f5 100644
+--- a/core/memop.c
++++ b/core/memop.c
+@@ -693,7 +693,9 @@ int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+         rc = do_vector(cpu, &op, va, el, pc);
+         break;
+     default: {
+-        if (op.align && (va & (op.bytes - 1))) return alignment_fault(cpu, va, op.store, pc);
++        /* FEAT_LSE2: an unaligned load-acquire or store-release within one 16-byte block is allowed. */
++        int lse2_ok = cpu->m->lse2 && op.kind == HV_MEM_ORDERED && (va & 15) + op.bytes <= 16;
++        if (op.align && (va & (op.bytes - 1)) && !lse2_ok) return alignment_fault(cpu, va, op.store, pc);
+         int pair = op.kind == HV_MEM_PAIR;
+         uint32_t esize = 1u << op.size;
+         uint8_t buf[32] = {0};
+diff --git a/core/mmu.c b/core/mmu.c
+index cebc788..232186c 100644
+--- a/core/mmu.c
++++ b/core/mmu.c
+@@ -870,6 +870,9 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
+     /* In the page, but where the fast check cannot pass (it allows HV_TLB_ADJ bytes of every access, so a small one in a
+        page's last HV_TLB_ADJ bytes misses): a refill would come straight back here. */
+     if (bytes <= HV_TLB_ADJ + 1 && off + HV_TLB_ADJ > PAGE_MASK) return 1;
++    /* Misaligned: an access that needs alignment (LDAR/STLR) fails the fast check however the TLB is filled, so a
++       refill would send it straight back here forever. The helper does it (or raises the alignment fault). */
++    if (!(bytes & (bytes - 1)) && (va & (bytes - 1))) return 1;
+     HvWalk w;
+     walk_begin(cpu, va);
+     hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
+diff --git a/core/sysreg.c b/core/sysreg.c
+index e19a2c0..1064940 100644
+--- a/core/sysreg.c
++++ b/core/sysreg.c
+@@ -174,6 +174,7 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
+     case R(3, 0, 0, 6, 0): *v = ID_AA64ISAR0; return 0;
+     case R(3, 0, 0, 6, 1): *v = ID_AA64ISAR1; return 0;
+     case R(3, 0, 0, 7, 0): *v = ID_AA64MMFR0; return 0;
++    case R(3, 0, 0, 7, 2): *v = cpu->m->lse2 ? 1ull << 32 : 0; return 0; /* MMFR2.AT: FEAT_LSE2 */
+     case R(3, 0, 0, 7, 1): *v = ID_AA64MMFR1 | (cpu->m->hafdbs ? 1 : 0); return 0;
+     case R(3, 3, 0, 0, 1): *v = CTR_EL0; return 0;
+     case R(3, 3, 0, 0, 7): *v = 4; return 0;                             /* DCZID: 64-byte DC ZVA */
+-- 
+2.46.2
+

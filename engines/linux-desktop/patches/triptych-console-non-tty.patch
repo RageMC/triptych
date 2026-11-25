@@ -1,0 +1,89 @@
+--- a/fs/tty-real.c	2026-11-22 11:38:02
++++ b/fs/tty-real.c	2026-11-22 11:38:02
+@@ -87,16 +87,19 @@
+ }
+ 
+ static struct termios old_termios;
+-static bool real_tty_is_open;
++static bool real_tty_has_termios;
+ static int real_tty_init(struct tty *tty) {
+     if (tty->num != REAL_TTY_NUM)
+         return 0;
+ 
+     struct winsize winsz;
+     if (ioctl(real_tty_host_fd(STDIN_FILENO), TIOCGWINSZ, &winsz) < 0) {
+-        if (errno == ENOTTY)
+-            goto notty;
+-        return errno_map();
++        // A non-terminal console (iOS gives apps no pty): a pipe reports ENOTTY, a Darwin socket EOPNOTSUPP.
++        if (errno != ENOTTY && errno != EOPNOTSUPP)
++            return errno_map();
++        tty->winsize.col = 80;
++        tty->winsize.row = 40;
++        goto notty;
+     }
+     tty->winsize.col = winsz.ws_col;
+     tty->winsize.row = winsz.ws_row;
+@@ -115,13 +118,14 @@
+ #endif
+     if (tcsetattr(real_tty_host_fd(STDIN_FILENO), TCSANOW, &termios) < 0)
+         ERRNO_DIE("failed to set terminal to raw mode");
++    real_tty_has_termios = true;
+ notty:
+ 
+-    if (pthread_create(&tty->thread, NULL,  real_tty_read_thread, tty) < 0)
+-        // ok if this actually happened it would be weird AF
++    if (pthread_create(&tty->thread, NULL,  real_tty_read_thread, tty) != 0) {
++        real_tty_reset_term();
+         return _EIO;
++    }
+     pthread_detach(tty->thread);
+-    real_tty_is_open = true;
+     return 0;
+ }
+ 
+@@ -132,7 +136,7 @@
+ }
+ 
+ void real_tty_reset_term() {
+-    if (!real_tty_is_open) return;
++    if (!real_tty_has_termios) return;
+     if (tcsetattr(real_tty_host_fd(STDIN_FILENO), TCSANOW, &old_termios) < 0 && errno != ENOTTY) {
+         printk("failed to reset terminal: %s\n", strerror(errno));
+         abort();
+--- a/xX_main_Xx.h	2026-11-22 11:38:02
++++ b/xX_main_Xx.h	2026-11-22 11:48:25
+@@ -64,17 +64,22 @@
+     const char *workdir = NULL;
+     const struct fs_ops *fs = &realfs;
+     const char *console = "/dev/tty1";
++    bool force_console = false; /* -t: a guest tty over a non-terminal host console (iOS: no pty for apps) */
+ #ifdef TRIPTYCH_EMBEDDED_CLI
+     // triptych_bridge.c supplies a fakefs root followed by the guest command.
+     // Keep libc's getopt state available to other in-process engines.
+-    if (argc < 4 || strcmp(argv[1], "-f")) return _EINVAL;
++    if (argc < 4 || (strcmp(argv[1], "-f") && strcmp(argv[1], "-tf"))) return _EINVAL;
++    force_console = argv[1][1] == 't';
+     root = argv[2];
+     fs = &fakefs;
+     const int command_index = 3;
+ #else
+     int opt;
+-    while ((opt = getopt(argc, argv, "+r:f:d:c:n:")) != -1) {
++    while ((opt = getopt(argc, argv, "+r:f:d:c:n:t")) != -1) {
+         switch (opt) {
++            case 't':
++                force_console = true;
++                break;
+             case 'r':
+             case 'f':
+                 root = optarg;
+@@ -262,7 +267,7 @@
+     if (err < 0)
+         return err;
+     tty_drivers[TTY_CONSOLE_MAJOR] = &real_tty_driver;
+-    if (isatty(real_tty_host_fd(STDIN_FILENO)) && isatty(real_tty_host_fd(STDOUT_FILENO))) {
++    if (force_console || (isatty(real_tty_host_fd(STDIN_FILENO)) && isatty(real_tty_host_fd(STDOUT_FILENO)))) {
+         err = create_stdio(console, TTY_CONSOLE_MAJOR, 1);
+         if (err < 0)
+             return err;

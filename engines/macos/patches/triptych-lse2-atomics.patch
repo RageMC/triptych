@@ -1,0 +1,59 @@
+From f14e02362cc027aa8b36cb2b8514f427e6a2b228 Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:11:39 -0500
+Subject: [PATCH] memop: FEAT_LSE2 misaligned CAS/atomics within 16 bytes don't
+ fault
+
+Windows does CASAL on addresses that are 8-byte misaligned but inside one
+16-byte block; real LSE2 hardware performs them atomically. Done here as a
+128-bit CAS of the aligned block.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/memop.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/core/memop.c b/core/memop.c
+index ad1c34a..be85b03 100644
+--- a/core/memop.c
++++ b/core/memop.c
+@@ -461,12 +461,35 @@ static uint64_t atomic_result(int aop, int size, uint64_t old, uint64_t s) {
+ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_t pc) {
+     int size = op->size;
+     uint32_t bytes = 1u << size;
+-    if (va & (bytes - 1)) return alignment_fault(cpu, va, 1, pc);
++    /* FEAT_LSE2: a misaligned CAS or atomic that stays inside one 16-byte block is single-copy atomic and takes no
++       alignment fault (Windows does CASAL on such addresses). Done as a 128-bit CAS of the aligned block. */
++    int lse2_mis = (va & (bytes - 1)) && cpu->m->lse2 && (va & 15) + bytes <= 16;
++    if ((va & (bytes - 1)) && !lse2_mis) return alignment_fault(cpu, va, 1, pc);
+     void *host;
+     uint64_t pa;
+     if (rmw_target(cpu, va, bytes, el, pc, &host, &pa)) return 1;
+     uint64_t mask = size == 3 ? ~0ull : (1ull << (8 << size)) - 1;
+     uint64_t old, s = gpr(cpu, op->rs);
++    if (lse2_mis) {
++        if (!host) goto external; /* device memory: not supported */
++        __uint128_t *blk = (__uint128_t *)((uintptr_t)host & ~(uintptr_t)15);
++        unsigned sh = (unsigned)(va & 15) * 8;
++        __uint128_t m128 = (__uint128_t)mask << sh, cur = __atomic_load_n(blk, __ATOMIC_RELAXED);
++        for (;;) {
++            old = (uint64_t)(cur >> sh) & mask;
++            uint64_t n;
++            if (op->kind == HV_MEM_CAS) {
++                if (old != (s & mask)) break;
++                n = gpr(cpu, op->rt);
++            } else {
++                n = atomic_result(op->atomic_op, size, old, s);
++            }
++            __uint128_t nw = (cur & ~m128) | ((__uint128_t)(n & mask) << sh);
++            if (__atomic_compare_exchange_n(blk, &cur, nw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
++        }
++        set_gpr(cpu, op->kind == HV_MEM_CAS ? op->rs : op->rt, old);
++        return 0;
++    }
+     if (op->kind == HV_MEM_CAS) {
+         uint64_t desired = gpr(cpu, op->rt) & mask;
+         if (host) {
+-- 
+2.46.2
+

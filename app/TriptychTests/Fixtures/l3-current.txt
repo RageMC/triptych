@@ -1,0 +1,5 @@
+[  1307.36ms][henge-jit] #1: the JIT region came back at 0x7000b04000, above 0x7000000000 where generated code does not run; giving it back. Quit Henge and open it again.
+[henge-jit] prewarm FAILED: 1610612736 bytes
+[ 47724.84ms][henge-jit] #2: the JIT region came back at 0x7000b04000, above 0x7000000000 where generated code does not run; giving it back. Quit Henge and open it again.
+[ 25923.58ms][prev] [ 38613.83ms][henge-jit] #2: the JIT region came back at 0x7000b80000, above 0x7000000000 where generated code does not run; giving it back. Quit Henge and open it again.
+[ 25923.59ms][prev] [henge-jit] prewarm FAILED: 1610612736 bytes

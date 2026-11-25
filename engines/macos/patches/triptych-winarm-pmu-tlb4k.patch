@@ -1,0 +1,196 @@
+From 62e4665a8af24d8304dac5dc0c4982fae593141b Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 06:01:45 -0500
+Subject: [PATCH] winarm: HV_TLB_PAGE_BITS build option (4 KB TLB pages) and a
+ PMUv3 cycle counter behind HvMachine.pmu_regs
+
+Windows and EDK2 map 4 KB pages, which a 16 KB TLB entry cannot hold, so every such access took the slow path (EDK2 spent minutes in DxeCore
+before the boot loader). Default stays 14. Windows' boot loader also writes PMCR/PMCNTENSET/PMCCFILTR and divides by a frequency it
+calibrates from PMCCNTR; zero there is a divide-by-zero BRK #0xf004.
+---
+ core/cpu.h      |  7 +++++-
+ core/dispatch.c |  2 +-
+ core/machine.h  |  1 +
+ core/memop.c    |  2 +-
+ core/mmu.h      |  2 +-
+ core/sysreg.c   | 62 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 71 insertions(+), 5 deletions(-)
+
+diff --git a/core/cpu.h b/core/cpu.h
+index aa9b938..a6fca62 100644
+--- a/core/cpu.h
++++ b/core/cpu.h
+@@ -30,7 +30,9 @@ static inline uint64_t hv_exec_key(uint64_t page_va, int64_t addend) {
+     return page_va ^ ((uint64_t)addend >> 20 | (uint64_t)addend << 44);
+ }
+ 
+-#define HV_TLB_PAGE_BITS 14
++#ifndef HV_TLB_PAGE_BITS
++#define HV_TLB_PAGE_BITS 14 /* winarm builds with 12: Windows and EDK2 map 4 KB pages, which a 16 KB TLB entry cannot hold */
++#endif
+ #define HV_TLB_ADJ 15
+ #define HV_TLB_INVALID 0x8080808080808080ull /* what memset(0x80) leaves */
+ #define HV_TLB_BITS 14 /* 16384 entries per EL: 256 MB of 16 KB pages (xnu's working set overflowed 64 MB) */
+@@ -171,6 +173,9 @@ typedef struct HvCpu {
+     _Atomic int halted;      /* HvHaltReason; published across CPU and UI threads */
+     int off;                 /* PSCI: powered off (a secondary not started yet, or CPU_OFF) until CPU_ON */
+     int parked_off;          /* off, and its thread is waiting (so CPU_ON may reset it) */
++    /* PMUv3 cycle counter only (HvMachine.pmu_regs): PMCCNTR runs at 2.4 GHz of the 24 MHz counter while enabled. */
++    uint64_t pmcr, pmcntenset, pmccntr_frozen, pmccntr_off, pmccfiltr, pmuserenr, pmselr, pmintenset;
++    int pmccntr_running;
+ } HvCpu;
+ 
+ #define HV_CPU_X(n)        ((n) * 8)
+diff --git a/core/dispatch.c b/core/dispatch.c
+index b9093c3..1d05ff9 100644
+--- a/core/dispatch.c
++++ b/core/dispatch.c
+@@ -1168,7 +1168,7 @@ static int run_loop(HvCpu *cpu, int one) {
+                     static uint64_t hist[4], total;
+                     uint32_t before = 0;
+                     uint64_t off = b->pa - b->ram->pa;
+-                    if (off & 0x3fff) memcpy(&before, b->ram->host + off - 4, 4);
++                    if (off & ((1ull << HV_TLB_PAGE_BITS) - 1)) memcpy(&before, b->ram->host + off - 4, 4);
+                     int k = cpu->miss_site ? 0 : before == 0xd5033fdf ? 1 : (before & 0xfff00000u) == 0xd5100000u ? 2 : 3;
+                     hist[k]++;
+                     if (++total % 200000 == 0)
+diff --git a/core/machine.h b/core/machine.h
+index b0cc42b..0a93e6c 100644
+--- a/core/machine.h
++++ b/core/machine.h
+@@ -248,6 +248,7 @@ typedef struct HvMachine {
+     uint32_t jit_gen;    /* full flushes so far, as blocks see them (HV_JIT_POISON checks) */
+     int gen_checks;
+     int trace;           /* print every block entered */
++    int pmu_regs;        /* PMEVCNTR/PMEVTYPER/PMCCFILTR (CRn 14, CRm 8..15) as RAZ/WI: Windows' boot loader writes them whether or not a PMU is advertised */
+     int hafdbs;          /* FEAT_HAFDBS, Access flag only (winarm: Windows on Arm needs it); macOS guests keep it off */
+     int psci_smc;        /* PSCI over SMC too (EDK2 + Windows on the winarm board: no EL3, so the HVC handler answers) */
+     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
+diff --git a/core/memop.c b/core/memop.c
+index 621d8ed..ae4cfee 100644
+--- a/core/memop.c
++++ b/core/memop.c
+@@ -625,7 +625,7 @@ static void pred_stat(HvCpu *cpu, const HvMemOp *op, uint64_t va, uint64_t pc, i
+     static __thread uint64_t last_reg[2][32], last_site[1 << 16], last_any;
+     static __thread uint64_t n, reg_hit, site_hit, either, any_hit, sp_n, sp_hit, k_n, k_reg, k_site;
+     int kernel = va >> 63;
+-    uint64_t key = va >> 14;
++    uint64_t key = va >> HV_TLB_PAGE_BITS;
+     if (!kernel) key ^= (cpu->ttbr0_el1 & ~1ull) << 20; /* user pages of different address spaces differ */
+     int r = op->mode == HV_ADDR_LITERAL ? 31 : op->rn; /* 31 here is SP (or the literal's PC) */
+     uint32_t s = (uint32_t)((pc >> 2) * 2654435761u) >> 16;
+diff --git a/core/mmu.h b/core/mmu.h
+index 3a4ee8f..0f9bbf8 100644
+--- a/core/mmu.h
++++ b/core/mmu.h
+@@ -49,7 +49,7 @@ static inline uint32_t hv_ijc_index(uint64_t tag) {
+     return (uint32_t)(((tag ^ tag >> 16 ^ tag >> 46) >> 2) & ((1u << (HV_IJC_BITS - 1)) - 1)) << 1;
+ }
+ static inline uint32_t hv_ijc_key(uint64_t va, uint64_t salt) {
+-    return (uint32_t)(((va >> 14) * 0x9e3779b97f4a7c15ull ^ (salt >> 48) * 0xc2b2ae3d27d4eb4full) >> 44);
++    return (uint32_t)(((va >> HV_TLB_PAGE_BITS) * 0x9e3779b97f4a7c15ull ^ (salt >> 48) * 0xc2b2ae3d27d4eb4full) >> 44);
+ }
+ /* Forget one address space's cached user targets. */
+ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid);
+diff --git a/core/sysreg.c b/core/sysreg.c
+index 67e7b23..e19a2c0 100644
+--- a/core/sysreg.c
++++ b/core/sysreg.c
+@@ -68,6 +68,59 @@ static int el0_allowed(HvCpu *cpu, uint32_t reg, int write) {
+ }
+ 
+ /* Returns 0 and sets *v, or -1 if the register does not exist. */
++#define PM_SCALE 100 /* cycle counter ticks per 24 MHz counter tick: a 2.4 GHz CPU */
++static uint64_t pm_cycles(HvCpu *cpu) {
++    return cpu->pmccntr_running ? counter() * PM_SCALE - cpu->pmccntr_off : cpu->pmccntr_frozen;
++}
++static void pm_update_running(HvCpu *cpu) {
++    int run = (cpu->pmcr & 1) && ((cpu->pmcntenset >> 31) & 1);
++    if (run == cpu->pmccntr_running) return;
++    if (run) cpu->pmccntr_off = counter() * PM_SCALE - cpu->pmccntr_frozen;
++    else cpu->pmccntr_frozen = counter() * PM_SCALE - cpu->pmccntr_off;
++    cpu->pmccntr_running = run;
++}
++static void pm_set_cycles(HvCpu *cpu, uint64_t v) {
++    cpu->pmccntr_frozen = v;
++    cpu->pmccntr_off = counter() * PM_SCALE - v;
++}
++/* The PMUv3 registers a boot loader uses to time itself: PMCR, PMCNTENSET/CLR, PMCCNTR, PMCCFILTR and the enables. No event
++   counters (PMCR.N = 0). Returns 1 if reg is one of them. */
++static int pmu_read(HvCpu *cpu, uint32_t reg, uint64_t *v) {
++    switch (reg) {
++    case R(3, 3, 9, 12, 0): *v = 0x41000000ull | (cpu->pmcr & 0x79); return 1;
++    case R(3, 3, 9, 12, 1): case R(3, 3, 9, 12, 2): *v = cpu->pmcntenset; return 1;
++    case R(3, 3, 9, 12, 5): *v = cpu->pmselr; return 1;
++    case R(3, 3, 9, 13, 0): *v = pm_cycles(cpu); return 1;
++    case R(3, 3, 9, 14, 0): *v = cpu->pmuserenr; return 1;
++    case R(3, 0, 9, 14, 1): case R(3, 0, 9, 14, 2): *v = cpu->pmintenset; return 1;
++    case R(3, 3, 14, 15, 7): *v = cpu->pmccfiltr; return 1;
++    default: return 0;
++    }
++}
++static int pmu_write(HvCpu *cpu, uint32_t reg, uint64_t v) {
++    switch (reg) {
++    case R(3, 3, 9, 12, 0):
++        cpu->pmcr = v & 0x79;
++        if (v & 4) pm_set_cycles(cpu, 0); /* C: reset the cycle counter */
++        pm_update_running(cpu);
++        return 1;
++    case R(3, 3, 9, 12, 1): cpu->pmcntenset |= v & 0x80000000ull; pm_update_running(cpu); return 1;
++    case R(3, 3, 9, 12, 2): cpu->pmcntenset &= ~(v & 0x80000000ull); pm_update_running(cpu); return 1;
++    case R(3, 3, 9, 12, 5): cpu->pmselr = v & 0x1f; return 1;
++    case R(3, 3, 9, 13, 0): pm_set_cycles(cpu, v); return 1;
++    case R(3, 3, 9, 14, 0): cpu->pmuserenr = v & 0xf; return 1;
++    case R(3, 0, 9, 14, 1): cpu->pmintenset |= v & 0x80000000ull; return 1;
++    case R(3, 0, 9, 14, 2): cpu->pmintenset &= ~(v & 0x80000000ull); return 1;
++    case R(3, 3, 14, 15, 7): cpu->pmccfiltr = v & 0xfc000000ull; return 1;
++    default: return 0;
++    }
++}
++
++/* PMEVCNTR<n>_EL0 (CRn 14, CRm 8..11), PMEVTYPER<n>_EL0 (CRm 12..14) and PMCCFILTR_EL0 (CRm 15, op2 7). */
++static int is_pmu_ext(uint32_t reg) {
++    return (reg >> 14) == 3 && ((reg >> 11) & 7) == 3 && ((reg >> 7) & 15) == 14 && ((reg >> 3) & 15) >= 8;
++}
++
+ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
+     uint64_t now = counter();
+     HvMachine *m = cpu->m;
+@@ -117,7 +170,7 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
+     case R(3, 0, 0, 0, 5): *v = cpu->mpidr; return 0;
+     case R(3, 0, 0, 0, 6): *v = 0; return 0;                             /* REVIDR */
+     case R(3, 0, 0, 4, 0): *v = ID_AA64PFR0; return 0;
+-    case R(3, 0, 0, 5, 0): *v = ID_AA64DFR0; return 0;
++    case R(3, 0, 0, 5, 0): *v = ID_AA64DFR0 | (cpu->m->pmu_regs ? 0x100 : 0); return 0; /* PMUVer 1 with pmu_regs */
+     case R(3, 0, 0, 6, 0): *v = ID_AA64ISAR0; return 0;
+     case R(3, 0, 0, 6, 1): *v = ID_AA64ISAR1; return 0;
+     case R(3, 0, 0, 7, 0): *v = ID_AA64MMFR0; return 0;
+@@ -151,10 +204,15 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
+         *v = 0;
+         return 0;
+     }
++    if (m->pmu_regs && pmu_read(cpu, reg, v)) return 0;
+     if ((reg >> 14) == 2 || (((reg >> 7) & 15) == 9 && (reg >> 14) == 3)) {
+         *v = 0;
+         return 0;
+     }
++    if (m->pmu_regs && is_pmu_ext(reg)) {
++        *v = 0;
++        return 0;
++    }
+     /* Apple implementation-defined registers (op0 3, CRn 15). The vmapple
+        kernel reads error-status registers there (S3_6_C15_C0_0, S3_3_C15_C8_0..)
+        when it reports a machine error; zero means no error recorded. */
+@@ -265,7 +323,9 @@ other:
+         return 0;
+     }
+     /* Debug and PMU registers: ignored. */
++    if (m->pmu_regs && pmu_write(cpu, reg, v)) return 0;
+     if ((reg >> 14) == 2 || (((reg >> 7) & 15) == 9 && (reg >> 14) == 3)) return 0;
++    if (m->pmu_regs && is_pmu_ext(reg)) return 0;
+     /* Apple implementation-defined registers (op0 3, CRn 15): ignored, see read_reg. */
+     if ((reg >> 14) == 3 && ((reg >> 7) & 15) == 15) {
+         if (m->log) fprintf(stderr, "hengevm: write to implementation-defined S3_%u_C15_C%u_%u ignored\n", (reg >> 11) & 7,
+-- 
+2.46.2
+

@@ -1,0 +1,55 @@
+From 18a128f794111c2fcf4edc81721ae896825383e7 Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:38:56 -0500
+Subject: [PATCH] Log rare guest sync exceptions (undefined, illegal, sysreg,
+ alignment)
+
+---
+ core/exception.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/core/exception.c b/core/exception.c
+index 9fe222c..a9d879e 100644
+--- a/core/exception.c
++++ b/core/exception.c
+@@ -52,6 +52,37 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
+         st->elchg[k].from = ret, st->elchg[k].spsr = spsr, st->elchg[k].kind = (uint32_t)type, st->elchg[k].el = cpu->el;
+         st->elchg[k].to = esr;
+     }
++    if (type == HV_EXC_SYNC) { /* rare classes (likely emulator gaps): undefined, illegal state, sysreg, alignment */
++        static int nrare;
++        uint32_t ec = esr >> 26;
++        int rare = ec == HV_EC_UNKNOWN || ec == HV_EC_ILLEGAL || ec == HV_EC_SYSREG || ec == HV_EC_PC_ALIGN ||
++                   ec == HV_EC_SP_ALIGN || ((ec == HV_EC_DABT_SAME || ec == HV_EC_DABT_LOWER) && (esr & 0x3f) == 0x21);
++        if (rare && cpu->el == 1 && nrare < 200) { /* kernel only: user code probes features this way all the time */
++            nrare++;
++            fprintf(stderr, "henge: rare exception ec=%02x esr=%08x far=%llx pc=%llx el%u\n", ec, esr,
++                    (unsigned long long)far, (unsigned long long)ret, cpu->el);
++        }
++    }
++    if (type == HV_EXC_SYNC && esr >> 26 == HV_EC_BRK && (esr & 0xffff) == 0xf002 && cpu->el == 1 && cpu->x[16] != 3) { /* 3: symbol loads */
++        /* Windows' debug service (DbgPrint and friends): show its text, e.g. the bugcheck's "Fatal System Error". */
++        static int nsvc;
++        if (nsvc++ < 64) {
++            char t[161] = {0}; uint64_t ptrs[3] = {cpu->x[0], cpu->x[1], 0}, pa, sp;
++            if (!hv_mmu_access(cpu, cpu->x[0] + 8, HV_ACC_READ, 1, &pa) && !hv_phys_read(cpu->m, pa, &sp, 8)) ptrs[2] = sp;
++            fprintf(stderr, "henge: debug service x0=%llx x1=%llx x2=%llx x16=%llx", (unsigned long long)cpu->x[0],
++                    (unsigned long long)cpu->x[1], (unsigned long long)cpu->x[2], (unsigned long long)cpu->x[16]);
++            for (int k = 0; k < 3; k++) {
++                if (!ptrs[k] || hv_mmu_access(cpu, ptrs[k], HV_ACC_READ, 1, &pa)) continue;
++                unsigned len = 160 - (unsigned)(pa & 0xfff) > 160 ? 160 : 4096 - (unsigned)(pa & 0xfff);
++                if (len > 160) len = 160;
++                memset(t, 0, sizeof t);
++                if (hv_phys_read(cpu->m, pa, t, len)) continue;
++                for (unsigned q = 0; q < len; q++) if (t[q] && (t[q] < 32 || t[q] > 126)) t[q] = '.';
++                fprintf(stderr, " | s%d \"%s\"", k, t);
++            }
++            fprintf(stderr, "\n");
++        }
++    }
+     if (cpu->m->trace || cpu->m->log >= 2)
+         fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u\n", type, esr, (unsigned long long)far,
+                 (unsigned long long)ret, cpu->el);
+-- 
+2.46.2
+

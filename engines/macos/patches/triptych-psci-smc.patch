@@ -1,0 +1,38 @@
+From f6205f2ab9d7fdacf91ab16b143e40987a3e31b7 Mon Sep 17 00:00:00 2001
+From: triptych <triptych@localhost>
+Date: Fri, 13 Nov 2026 19:49:41 -0500
+Subject: [PATCH] PSCI over SMC for boards without EL3 (winarm)
+
+---
+ core/exception.c | 2 +-
+ core/machine.h   | 1 +
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/core/exception.c b/core/exception.c
+index 40ab4f9..38cdb59 100644
+--- a/core/exception.c
++++ b/core/exception.c
+@@ -241,7 +241,7 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+         hv_take_exception(cpu, HV_EXC_SYNC, HV_EC_SVC64 << 26 | 1u << 25 | imm16, 0, 0, pc + 4);
+         return 1;
+     }
+-    if (opc == 0 && ll == 2 && cpu->el == 1) { /* HVC: the hypervisor's PSCI and vmapple's PAC calls */
++    if (((opc == 0 && ll == 2) || (opc == 0 && ll == 3 && cpu->m->psci_smc)) && cpu->el == 1) { /* HVC (or SMC on boards with psci_smc): PSCI and vmapple's PAC calls */
+         cpu->x[0] = psci(cpu, cpu->x[0]);
+         if (!cpu->halted && !cpu->off) return 0; /* like a call: the block carries on (xnu makes one per context switch) */
+         cpu->pc = pc + 4;
+diff --git a/core/machine.h b/core/machine.h
+index e492c65..b7633fb 100644
+--- a/core/machine.h
++++ b/core/machine.h
+@@ -248,6 +248,7 @@ typedef struct HvMachine {
+     uint32_t jit_gen;    /* full flushes so far, as blocks see them (HV_JIT_POISON checks) */
+     int gen_checks;
+     int trace;           /* print every block entered */
++    int psci_smc;        /* PSCI over SMC too (EDK2 + Windows on the winarm board: no EL3, so the HVC handler answers) */
+     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
+     int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
+     uint64_t switch_flush_pc[4]; /* HV_SWITCH_FLUSH=3: PCs of the TLBI VMALLE1s seen within 20 us of a TTBR0 change (xnu's pmap switch) */
+-- 
+2.46.2
+

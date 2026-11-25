@@ -1,0 +1,316 @@
+From 1b5d513fff19da39d24e2ff7a355b1f58aee9cd9 Mon Sep 17 00:00:00 2001
+From: Triptych <triptych@localhost>
+Date: Sun, 15 Nov 2026 02:21:43 -0500
+Subject: [PATCH] Embedding entry points for Triptych (husk_embed_make_root,
+ husk_embed_open_url)
+
+---
+ src/app/Husk/GuestImage.swift    |   6 +-
+ src/app/Husk/HuskApp.swift       | 105 +++++++++++++++++++++++++++----
+ src/app/Husk/HuskMetalView.swift |   3 +-
+ src/app/Husk/JITBootstrap.swift  |   4 +-
+ src/app/Husk/JITLess.swift       |   2 +-
+ src/app/Husk/QemuRunner.swift    |   8 +--
+ src/app/Husk/TLUnityView.swift   |  15 +++--
+ 7 files changed, 114 insertions(+), 29 deletions(-)
+
+diff --git a/src/app/Husk/GuestImage.swift b/src/app/Husk/GuestImage.swift
+index 438afb5..470d0d5 100644
+--- a/src/app/Husk/GuestImage.swift
++++ b/src/app/Husk/GuestImage.swift
+@@ -441,7 +441,7 @@ final class GuestImage: ObservableObject {
+         cleanUpPreviousGuest()
+         let fm = FileManager.default
+         if !fm.fileExists(atPath: firmwarePath) {
+-            guard let src = Bundle.main.path(forResource: "edk2-aarch64-code", ofType: "fd") else {
++            guard let src = Bundle.huskResourcePath("edk2-aarch64-code", ofType: "fd") else {
+                 throw NSError(domain: "husk", code: 1, userInfo: [
+                     NSLocalizedDescriptionKey: "edk2-aarch64-code.fd missing from the app bundle"])
+             }
+@@ -475,7 +475,7 @@ final class GuestImage: ObservableObject {
+             // fails to resolve and the firmware falls back to scanning for
+             // \EFI\BOOT\BOOTAA64.EFI, which is where it would have ended up
+             // starting from empty anyway.
+-            guard let seed = Bundle.main.path(forResource: "lineage-efi-vars-seed", ofType: "fd") else {
++            guard let seed = Bundle.huskResourcePath("lineage-efi-vars-seed", ofType: "fd") else {
+                 throw NSError(domain: "husk", code: 2, userInfo: [
+                     NSLocalizedDescriptionKey: "lineage-efi-vars-seed.fd missing from the app bundle"])
+             }
+@@ -511,7 +511,7 @@ final class GuestImage: ObservableObject {
+             } else {
+                 // Check for the replacement before deleting existing data. A
+                 // missing resource must not turn an upgrade into a missing disk.
+-                guard let seed = Bundle.main.path(forResource: "lineage-vdb-seed", ofType: "qcow2") else {
++                guard let seed = Bundle.huskResourcePath("lineage-vdb-seed", ofType: "qcow2") else {
+                     throw NSError(domain: "husk", code: 3, userInfo: [
+                         NSLocalizedDescriptionKey: "lineage-vdb-seed.qcow2 missing from the app bundle"])
+                 }
+diff --git a/src/app/Husk/HuskApp.swift b/src/app/Husk/HuskApp.swift
+index da6686e..12031d0 100644
+--- a/src/app/Husk/HuskApp.swift
++++ b/src/app/Husk/HuskApp.swift
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ import SwiftUI
++import UIKit
+ 
+ /// Which way the app may turn. The app follows the device, except while a landscape game is on screen:
+ /// Geometry Dash is a landscape game, and a fixed-size surface cannot follow a rotation.
+@@ -54,16 +55,65 @@ final class HuskAppDelegate: NSObject, UIApplicationDelegate {
+     }
+ }
+ 
++#if !TRIPTYCH_EMBED
+ @main
+ struct HuskApp: App {
+     @UIApplicationDelegateAdaptor(HuskAppDelegate.self) private var appDelegate
+ 
+-    init() {
++    init() { HuskBoot.run() }
++
++    var body: some Scene {
++        WindowGroup { HuskRootView() }
++    }
++}
++#endif
++
++private final class HuskBundleToken {}
++
++extension Bundle {
++    static let husk = Bundle(for: HuskBundleToken.self)
++
++    static func huskResourcePath(_ name: String, ofType ext: String? = nil, inDirectory sub: String? = nil) -> String? {
++        husk.path(forResource: name, ofType: ext, inDirectory: sub)
++            ?? main.path(forResource: name, ofType: ext, inDirectory: sub)
++    }
++
++    static func huskSubdirectory(_ name: String) -> String? {
++        for bundle in [husk, main] {
++            if let p = bundle.resourcePath.map({ $0 + "/" + name }),
++               FileManager.default.fileExists(atPath: p) {
++                return p
++            }
++        }
++        return nil
++    }
++
++    static func huskPrivateFrameworkFile(_ relative: String) -> String {
++        for bundle in [main, husk] {
++            if let fw = bundle.privateFrameworksPath {
++                let candidate = fw + "/" + relative
++                if FileManager.default.fileExists(atPath: candidate) { return candidate }
++            }
++        }
++        return (main.privateFrameworksPath ?? "") + "/" + relative
++    }
++}
++
++/// Start-up work, shared by the Husk app and by hosts that embed Husk
++/// (Triptych loads HuskRuntime.framework as a dynamic library and calls the C entry points below).
++@MainActor
++enum HuskBoot {
++    private static var done = false
++
++    static func run() {
++        if done { return }
++        done = true
+         // Order matters. HuskLog redirects stderr, so anything that logs before
+         // this point is lost -- and the JIT path is exactly what we cannot afford
+         // to lose the first line of.
+         HuskLog.start()
+         HuskLog.logFootprint("app-launch")
++        _ = Downloads.shared
+         // Before anything asks a debugger for anything: was this process already marked as debugged (a jailbreak that allows JIT in apps)?
+         JITBootstrap.noteLaunchState()
+         HuskLog.log("jit", "debugged at launch: \(JITBootstrap.debuggedAtLaunch); TrollStore install: \(JITBootstrap.isInstalledWithTrollStore); jailbreak: \(JITBootstrap.isJailbroken); can grant its own JIT: \(JITBootstrap.canGrantOwnJIT)")
+@@ -84,17 +134,48 @@ struct HuskApp: App {
+         // Game controllers, for the games the native runtime runs.
+         Task { @MainActor in HuskGamepads.shared.start() }
+     }
++}
+ 
+-    var body: some Scene {
+-        WindowGroup {
+-            ContentView()
+-                // An APK shared to Husk, or opened in it from Files.
+-                .onOpenURL { url in
+-                    // husk://open_app?unique_identifier=… from a Home Screen clip; anything else may be a shared APK
+-                    if GameLink.handle(url) { return }
+-                    if SigningCertificate.shared.handle(url) { return }   // husk://certificate from SideStore / AltStore
+-                    if !AppClip.handle(url) { IncomingFiles.shared.receive(url) }
+-                }
+-        }
++struct HuskRootView: View {
++    var body: some View {
++        ContentView()
++            // An APK shared to Husk, or opened in it from Files.
++            .onOpenURL { url in
++                HuskBoot.handleURL(url)
++            }
++    }
++}
++
++extension HuskBoot {
++    @discardableResult
++    static func handleURL(_ url: URL) -> Bool {
++        // husk://open_app?unique_identifier=… from a Home Screen clip; anything else may be a shared APK
++        if GameLink.handle(url) { return true }
++        if SigningCertificate.shared.handle(url) { return true }   // husk://certificate from SideStore / AltStore
++        if AppClip.handle(url) { return true }
++        IncomingFiles.shared.receive(url)
++        return true
++    }
++}
++
++// MARK: - Embedding (Triptych)
++
++/// Returns a retained UIViewController that shows Husk. Runs the start-up work once.
++@_cdecl("husk_embed_make_root")
++public func husk_embed_make_root() -> UnsafeMutableRawPointer {
++    MainActor.assumeIsolated {
++        HuskBoot.run()
++        let vc = UIHostingController(rootView: HuskRootView())
++        return Unmanaged.passRetained(vc as UIViewController).toOpaque()
++    }
++}
++
++/// Hands a URL (husk://…, a shared .apk) to Husk. Returns 1 if it was used.
++@_cdecl("husk_embed_open_url")
++public func husk_embed_open_url(_ cstr: UnsafePointer<CChar>) -> Int32 {
++    guard let url = URL(string: String(cString: cstr)) else { return 0 }
++    return MainActor.assumeIsolated {
++        HuskBoot.run()
++        return HuskBoot.handleURL(url) ? 1 : 0
+     }
+ }
+diff --git a/src/app/Husk/HuskMetalView.swift b/src/app/Husk/HuskMetalView.swift
+index 70a0c25..926a1f5 100644
+--- a/src/app/Husk/HuskMetalView.swift
++++ b/src/app/Husk/HuskMetalView.swift
+@@ -36,7 +36,8 @@ final class HuskMetalView: MTKView {
+     }
+ 
+     private func buildPipeline() {
+-        guard let device, let library = device.makeDefaultLibrary() else {
++        guard let device,
++              let library = (try? device.makeDefaultLibrary(bundle: .husk)) ?? device.makeDefaultLibrary() else {
+             log.error("no Metal default library; is Shaders.metal in the target?")
+             return
+         }
+diff --git a/src/app/Husk/JITBootstrap.swift b/src/app/Husk/JITBootstrap.swift
+index 07822c8..41dd9c4 100644
+--- a/src/app/Husk/JITBootstrap.swift
++++ b/src/app/Husk/JITBootstrap.swift
+@@ -383,8 +383,8 @@ enum JITBootstrap {
+         // Accept either bundle layout: the build copies husk-jit.js to the bundle
+         // root, but a folder-reference build phase would put it under Resources/.
+         let candidates = [
+-            Bundle.main.path(forResource: "husk-jit", ofType: "js"),
+-            Bundle.main.path(forResource: "husk-jit", ofType: "js", inDirectory: "Resources"),
++            Bundle.huskResourcePath("husk-jit", ofType: "js"),
++            Bundle.huskResourcePath("husk-jit", ofType: "js", inDirectory: "Resources"),
+         ]
+         for case let path? in candidates {
+             if let s = try? String(contentsOfFile: path, encoding: .utf8) { return s }
+diff --git a/src/app/Husk/JITLess.swift b/src/app/Husk/JITLess.swift
+index 1314790..0c05c5b 100644
+--- a/src/app/Husk/JITLess.swift
++++ b/src/app/Husk/JITLess.swift
+@@ -53,7 +53,7 @@ enum JITLess {
+     /// The Java runtime's own native libraries (libjavacore, libopenjdk, ICU, conscrypt...), which apps on Husk's Java runtime load
+     /// from the app bundle: converted on the device like a game's, once.
+     static var runtimeLibraries: [String] {
+-        guard let root = Bundle.main.resourcePath.map({ $0 + "/java-runtime" }),
++        guard let root = Bundle.huskSubdirectory("java-runtime"),
+               let e = FileManager.default.enumerator(atPath: root) else { return [] }
+         return e.compactMap { $0 as? String }.filter { $0.hasSuffix(".so") }.map { root + "/" + $0 }
+     }
+diff --git a/src/app/Husk/QemuRunner.swift b/src/app/Husk/QemuRunner.swift
+index 98bcd0f..4b1fbd1 100644
+--- a/src/app/Husk/QemuRunner.swift
++++ b/src/app/Husk/QemuRunner.swift
+@@ -219,7 +219,7 @@ final class QemuRunner: ObservableObject {
+     /// being run on device: the kernel reaches userspace, virtio-gpu registers
+     /// fb0, and the virtio tablet and keyboard both enumerate.
+     private func phase0Arguments() -> [String] {
+-        let bundle = Bundle.main.bundlePath
++        let bundle = Bundle.huskSubdirectory("vmlinuz-virt") != nil ? Bundle.husk.bundlePath : Bundle.main.bundlePath
+ 
+         return [
+             "qemu-system-aarch64",
+@@ -1143,7 +1143,7 @@ final class QemuRunner: ObservableObject {
+             "-device", "virtio-net-pci,netdev=net0",
+             "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:5555-:5555,"
+                      + "hostfwd=tcp:127.0.0.1:5599-:5599",
+-            "-L", "\(Bundle.main.bundlePath)/pc-bios",
++            "-L", Bundle.huskSubdirectory("pc-bios") ?? "\(Bundle.main.bundlePath)/pc-bios",
+ 
+             // 360x640 rather than 1280x800: a quarter of the pixels.
+             //
+@@ -1376,8 +1376,8 @@ final class QemuRunner: ObservableObject {
+         // Confirm the guest images are actually in the bundle before QEMU tries to
+         // open them; "could not load kernel" is a far less obvious error message.
+         let required: [String] = (profile == .phase0Alpine)
+-            ? ["\(Bundle.main.bundlePath)/vmlinuz-virt",
+-               "\(Bundle.main.bundlePath)/initramfs-virt"]
++            ? [Bundle.huskResourcePath("vmlinuz-virt") ?? "\(Bundle.main.bundlePath)/vmlinuz-virt",
++               Bundle.huskResourcePath("initramfs-virt") ?? "\(Bundle.main.bundlePath)/initramfs-virt"]
+             : [GuestImage.shared.diskPath,
+                GuestImage.shared.userdataPath,
+                GuestImage.shared.firmwarePath,
+diff --git a/src/app/Husk/TLUnityView.swift b/src/app/Husk/TLUnityView.swift
+index 355cee4..6f682f9 100644
+--- a/src/app/Husk/TLUnityView.swift
++++ b/src/app/Husk/TLUnityView.swift
+@@ -252,8 +252,8 @@ final class TLUnityUIView: UIView, UIKeyInput {
+     private func launch(width: Int, height: Int) {
+         launched = true
+         launchedSize = bounds.size
+-        let angle = (Bundle.main.privateFrameworksPath ?? "") + "/libANGLE-shared.dylib"
+-        let ca = Bundle.main.path(forResource: "cacert", ofType: "pem") ?? ""
++        let angle = Bundle.huskPrivateFrameworkFile("libANGLE-shared.dylib")
++        let ca = Bundle.huskResourcePath("cacert", ofType: "pem") ?? ""
+         try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+         let layerPtr = Unmanaged.passUnretained(layer).toOpaque()
+         let loaded = husk_native_loaded_apk().map { String(cString: $0) }
+@@ -283,7 +283,7 @@ final class TLUnityUIView: UIView, UIKeyInput {
+         // in Husk's "Shared Storage", which can be filled from Files or Finder.
+         husk_native_set_shared_storage(TranslationLayer.sharedStorage.path)
+         // The CA certificates and system fonts Android keeps under /system, as the app carries them.
+-        if let sys = Bundle.main.resourcePath.map({ $0 + "/android-system" }), FileManager.default.fileExists(atPath: sys) {
++        if let sys = Bundle.huskSubdirectory("android-system") {
+             husk_native_set_system_files(sys + "/cacerts", sys)
+         }
+         husk_native_set_extra_fonts(CJKFonts.directory.path)
+@@ -296,14 +296,16 @@ final class TLUnityUIView: UIView, UIKeyInput {
+                 husk_sdl_set_safe_insets(Int32(inset.left * k), Int32(inset.top * k), Int32(inset.right * k), Int32(inset.bottom * k))
+             }
+             // Vulkan for the SDL games that draw with it (directly, or through DXVK): MoltenVK, as for Unreal.
+-            if let fw = Bundle.main.privateFrameworksPath { husk_ue4_set_vulkan(fw + "/MoltenVK.framework/MoltenVK") }
++            let mvk = Bundle.huskPrivateFrameworkFile("MoltenVK.framework/MoltenVK")
++            if FileManager.default.fileExists(atPath: mvk) { husk_ue4_set_vulkan(mvk) }
+             started = husk_sdl_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
+         case .gta: started = husk_gta_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
+         case .godot: started = husk_godot_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
+         case .nativeactivity: started = husk_ue4_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)       // the NativeActivity driver; with no Unreal in the APK it runs the plain game
+         case .ue4:
+             // Unreal draws with Vulkan, which on this device is MoltenVK, a framework of the app's own.
+-            if let fw = Bundle.main.privateFrameworksPath { husk_ue4_set_vulkan(fw + "/MoltenVK.framework/MoltenVK") }
++            let mvk = Bundle.huskPrivateFrameworkFile("MoltenVK.framework/MoltenVK")
++            if FileManager.default.fileExists(atPath: mvk) { husk_ue4_set_vulkan(mvk) }
+             started = husk_ue4_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
+         case .cocos:
+             // Geode, when it is on for this game and downloaded: loaded into the game after its own libraries.
+@@ -313,7 +315,8 @@ final class TLUnityUIView: UIView, UIKeyInput {
+             started = husk_cocos_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
+         case .java:
+             // Husk's Dalvik runtime: libcore, ICU and Husk's Java framework, carried in the app.
+-            husk_java_set_runtime((Bundle.main.resourcePath ?? "") + "/java-runtime", Float(contentScaleFactor))
++            let javaRuntime = Bundle.huskSubdirectory("java-runtime") ?? ((Bundle.main.resourcePath ?? "") + "/java-runtime")
++            husk_java_set_runtime(javaRuntime, Float(contentScaleFactor))
+             husk_java_set_night_mode(traitCollection.userInterfaceStyle == .dark ? 1 : 0)
+             // The notch and the home indicator, in surface pixels: the app's window keeps its content out of them.
+             if let inset = windowed ? UIEdgeInsets.zero : window?.safeAreaInsets {
+-- 
+2.54.0 (Apple Git-157)
+

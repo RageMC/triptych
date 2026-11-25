@@ -1,0 +1,672 @@
+diff --git a/devices/pvg_lite.c b/devices/pvg_lite.c
+index c02229de..9850b46c 100644
+--- a/devices/pvg_lite.c
++++ b/devices/pvg_lite.c
+@@ -8,7 +8,8 @@
+      +1020 channel doorbell (the value is the channel)
+      +1018 stamps-updated bits (1 << channel), +1014 display bits, +102c faults
+      +1034 protocol version (the driver offers one, the device answers),
+-     +122c number of displays
++     +122c number of displays, +1234 each port's connection type (2 bits per
++       port; 0 reads as external, so macOS gives the panel no corner artwork)
+ 
+    FIFO buffer: a control area where stamp[channel] is at +4 * channel, then
+    the root ring. Root page: channel records at 0x400 + 0x14 * (channel - 1)
+@@ -90,6 +91,14 @@ struct HvPvgLite {
+     int metal_tried;
+     uint32_t stamps_pending; /* channels Metal finished, for the next poll */
+     uint64_t vblanks;        /* refresh events sent (HV_PVG_VBLANK) */
++    uint32_t display_gen;    /* the size generation the guest was last told of */
++    uint32_t display_seq;    /* the mode list's sequence number, which the guest acks */
++    uint64_t display_mode;   /* width << 32 | height last told */
++    float display_ppmm;      /* and the density that went with it */
++    uint64_t display_taken;  /* the same for the list the guest acked last */
++    uint32_t display_bits;   /* +1014: displays with an event for the guest */
++    int display_reads_logged;
++    int external; /* HV_PVG_EXTERNAL=1: answer as an external display (no rounded corners), read once per machine */
+ };
+ 
+ /* What the guest's GetDeviceInfo asks for: key, value pairs, as the framework
+@@ -156,52 +165,101 @@ static void ring_read(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32
+     }
+ }
+ 
+-/* The one mode the display offers. macOS takes the size it is given at boot. */
+-static uint32_t display_w = 1920, display_h = 1080;
+-/* The panel's real size, when known: macOS works out the pixel density from it and
+-   picks HiDPI (2x) for a Retina-dense panel, as on a real Mac. 0 = the old 400 mm. */
+-static uint32_t display_mm_w, display_mm_h;
++/* The one mode the display offers: the size it is given before boot, and any size given while macOS runs (a window
++   or a display of another shape), which goes to the guest as a new mode list. Width in the high half, height in the
++   low, so a change is one store; the generation says one happened. */
++static _Atomic uint64_t display_size = (uint64_t)1920 << 32 | 1080;
++static _Atomic uint32_t display_gen = 1;
++/* The panel's real size, when known: macOS works out the pixel density from it and picks HiDPI (2x) for a
++   Retina-dense panel, as on a real Mac. Kept as pixels per mm so a new size keeps the density. 0 = the old 400 mm. */
++static _Atomic float display_ppmm;
+ 
+ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm) {
+-    display_mm_w = width_mm;
+-    display_mm_h = height_mm;
++    uint32_t w = (uint32_t)(atomic_load(&display_size) >> 32);
++    (void)height_mm;
++    atomic_store(&display_ppmm, width_mm && height_mm ? (float)w / (float)width_mm : 0.0f);
++    atomic_fetch_add(&display_gen, 1);
++}
++
++void hv_pvg_lite_set_mode_density(uint32_t width, uint32_t height, float px_per_mm) {
++    if (!width || !height) return;
++    atomic_store(&display_ppmm, px_per_mm > 0 ? px_per_mm : 0.0f);
++    atomic_store(&display_size, (uint64_t)width << 32 | height);
++    atomic_fetch_add(&display_gen, 1);
+ }
+ 
+ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height) {
+-    display_w = width;
+-    display_h = height;
++    if (!width || !height) return;
++    uint64_t want = (uint64_t)width << 32 | height;
++    if (atomic_exchange(&display_size, want) != want) atomic_fetch_add(&display_gen, 1);
+ }
+ 
+-static void display_set_page(HvPvgLite *p, uint64_t pa) {
+-    uint8_t *d = hv_phys_ptr(p->m, pa, 0x4000);
+-    if (!d) return;
+-    p->display_pa = pa;
++/* The mode list and what goes with it, as the guest reads it: physical size, then the one mode at its rate. */
++static void display_put_modes(uint8_t *d, uint32_t w, uint32_t h) {
+ #define PUT32(off, v) (*(uint32_t *)(d + (off)) = (uint32_t)(v))
+ #define PUTF(off, v) (*(float *)(d + (off)) = (v))
+-    PUT32(0x00, 1);
+-    uint32_t width_mm = 400, height_mm = 400 * display_h / display_w; /* the same pixel density at any shape */
+-    if (display_mm_w && display_mm_h) width_mm = display_mm_w, height_mm = display_mm_h;
++    float ppmm = atomic_load(&display_ppmm);
++    uint32_t width_mm = 400, height_mm = 400 * h / w; /* the same pixel density at any shape */
++    if (ppmm > 0) width_mm = (uint32_t)(w / ppmm + 0.5f), height_mm = (uint32_t)(h / ppmm + 0.5f);
+     PUT32(0x14, height_mm << 16 | width_mm);
+-    PUT32(0x18, 0x01000100);
+-    PUT32(0x1c, 0x400);
+-    PUT32(0x20, 3);
+     PUTF(0x24, (float)width_mm);
+     PUTF(0x28, (float)height_mm);
+     PUT32(0x208, 1); /* one mode: */
+-    PUT32(0x210, display_h << 16 | display_w);
++    PUT32(0x210, h << 16 | w);
+     {   /* m4 fork: 120 Hz on ProMotion (HV_HZ), so WindowServer animates at the panel's rate */
+         const char *hz = getenv("HV_HZ");
+         uint32_t r = hz && atoi(hz) > 0 ? (uint32_t)atoi(hz) : 60;
+         PUT32(0x214, r << 16);
+     }
++#undef PUT32
++#undef PUTF
++}
++
++/* Display events, as ParavirtualizedGraphics raises them (_PGDisplayNub's state machine): the bits ORed into +100;
++   if the guest's mask at +104 takes any of them, the port's bit (display 0) goes into +1014, which clears when read,
++   and the interrupt is raised. */
++static void display_event(HvPvgLite *p, uint8_t *d, uint32_t bits) {
++    uint32_t mask = __atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE);
++    __atomic_fetch_or((uint32_t *)(d + 0x100), bits, __ATOMIC_ACQ_REL);
++    if (mask & bits) {
++        __atomic_fetch_or(&p->display_bits, 1, __ATOMIC_ACQ_REL);
++        hv_gicv3_pend(p->gic, p->gfx_irq);
++    }
++}
++
++/* A mode list for the guest to ack: the next sequence number, ack pending, the events (4 the first time, the hotplug;
++   0xc for a change after an ack), and the state (1, waiting for the ack) stored last. */
++static void display_announce(HvPvgLite *p, uint8_t *d, uint32_t events) {
++    p->display_seq++;
++    *(uint32_t *)(d + 0x200) = p->display_seq;
++    d[0xfa9] = 1;
++    display_event(p, d, events);
++    __atomic_store_n((uint32_t *)(d + 0xfc0), 1, __ATOMIC_RELEASE);
++}
++
++static void display_set_page(HvPvgLite *p, uint64_t pa) {
++    uint8_t *d = hv_phys_ptr(p->m, pa, 0x4000);
++    if (!d) return;
++    p->display_pa = pa;
++#define PUT32(off, v) (*(uint32_t *)(d + (off)) = (uint32_t)(v))
++#define PUTF(off, v) (*(float *)(d + (off)) = (v))
++    PUT32(0x00, 1);
++    PUT32(0x18, 0x01000100);
++    PUT32(0x1c, 0x400);
++    PUT32(0x20, 3);
++    /* +60 flags: 0 or 2 makes the driver mark the display external (no rounded-corner artwork); any other bit makes it
++       the primary built-in panel. HV_PVG_EXTERNAL=1 keeps it external. */
++    PUT32(0x60, p->external ? 0 : 1);
++    p->display_gen = atomic_load(&display_gen);
++    uint64_t size = atomic_load(&display_size);
++    p->display_mode = size, p->display_ppmm = atomic_load(&display_ppmm);
++    display_put_modes(d, (uint32_t)(size >> 32), (uint32_t)size);
+     PUTF(0xa10, 1.0f); /* identity colour matrix */
+     PUTF(0xa24, 1.0f);
+     PUTF(0xa38, 1.0f);
+     d[0xa73] = 1;
+-    PUT32(0x200, 1); /* the mode list's sequence number, which the guest acks */
+-    d[0xfa9] = 1;    /* ack pending */
+-    PUT32(0xfc0, 1); /* state: told the guest, waiting for the ack */
+-    __atomic_store_n((uint32_t *)(d + 0x100), 4, __ATOMIC_RELEASE); /* mode change: read when the guest sets its mask */
++    p->display_seq = 0;
++    display_announce(p, d, 4);
+ #undef PUT32
+ #undef PUTF
+ }
+@@ -209,9 +267,40 @@ static void display_set_page(HvPvgLite *p, uint64_t pa) {
+ static void display_ack(HvPvgLite *p, uint32_t seq) {
+     uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
+     if (!d) return;
++    fprintf(stderr, "hengevm: pvg-lite: display ack %u (published %u, %ux%u)\n", seq, p->display_seq,
++            (unsigned)(p->display_mode >> 32), (unsigned)p->display_mode);
++    /* As the framework: an ack counts only for the list waiting for one. A size asked for meanwhile goes out on the
++       next poll, now that the state is 2. */
++    if (!d[0xfa9] || seq != *(uint32_t *)(d + 0x200)) return;
+     *(uint32_t *)(d + 0xfbc) = seq;
+     d[0xfa9] = 0;
+-    *(uint32_t *)(d + 0xfc0) = 2;
++    __atomic_store_n((uint32_t *)(d + 0xfc0), 2, __ATOMIC_RELEASE);
++    __atomic_store_n(&p->display_taken, p->display_mode, __ATOMIC_RELEASE);
++}
++
++int hv_pvg_lite_display_mode(HvPvgLite *p, uint32_t *width, uint32_t *height) {
++    uint64_t mode = p ? __atomic_load_n(&p->display_taken, __ATOMIC_ACQUIRE) : 0;
++    if (!mode) return -1;
++    *width = (uint32_t)(mode >> 32), *height = (uint32_t)mode;
++    return 0;
++}
++
++/* A size given while macOS runs: sent once the guest has acked the last list (state 2), as the framework does; until
++   then it waits, and the newest size asked for is the one sent. Device lock held. */
++static void display_follow(HvPvgLite *p) {
++    uint32_t gen = atomic_load_explicit(&display_gen, memory_order_acquire);
++    if (gen == p->display_gen || !p->display_pa) return;
++    uint8_t *d = hv_phys_ptr(p->m, p->display_pa, 0x4000);
++    if (!d || __atomic_load_n((uint32_t *)(d + 0xfc0), __ATOMIC_ACQUIRE) != 2) return;
++    p->display_gen = gen;
++    uint64_t size = atomic_load(&display_size);
++    float ppmm = atomic_load(&display_ppmm);
++    if (size == p->display_mode && ppmm == p->display_ppmm) return; /* nothing the guest has not got */
++    p->display_mode = size, p->display_ppmm = ppmm;
++    display_put_modes(d, (uint32_t)(size >> 32), (uint32_t)size);
++    display_announce(p, d, 0xc);
++    fprintf(stderr, "hengevm: pvg-lite: display mode %ux%u (seq %u, +100 %x, mask %x)\n", (unsigned)(size >> 32), (unsigned)size,
++            p->display_seq, *(uint32_t *)(d + 0x100), *(uint32_t *)(d + 0x104));
+ }
+ 
+ static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n);
+@@ -726,14 +815,14 @@ static void vblank(HvPvgLite *p) {
+     uint64_t now = mach_absolute_time();
+     if (now < next) return;
+     next = now + period;
+-    __atomic_fetch_or((uint32_t *)(d + 0x100), 8, __ATOMIC_RELEASE);
++    display_event(p, d, 8);
+     p->vblanks++;
+-    hv_gicv3_pend(p->gic, p->gfx_irq);
+ }
+ 
+ void hv_pvg_lite_poll(HvPvgLite *p) {
+     if (!p) return;
+     vblank(p);
++    display_follow(p);
+     uint32_t chans = p->chan_pending;
+     if (chans) {
+         p->chan_pending = 0;
+@@ -755,6 +844,11 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
+         v = __atomic_exchange_n(&p->status, 0, __ATOMIC_ACQ_REL);
+         break;
+     case 0x122c: v = 1; break;
++    case 0x1234: v = p->external ? 0 : 1; break; /* port 0 built in, not external */
++    case 0x1014: /* displays with an event, cleared by the read */
++        v = __atomic_exchange_n(&p->display_bits, 0, __ATOMIC_ACQ_REL);
++        if (v && p->display_reads_logged++ < 4) fprintf(stderr, "hengevm: pvg-lite: guest reads +1014 = %llx\n", (unsigned long long)v);
++        break;
+     default:
+         if (off >= 0x1000 && off < 0x2000) v = p->regs[(off - 0x1000) / 4];
+         break;
+@@ -804,6 +898,7 @@ HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_
+     p->iosfc_irq = iosfc_irq;
+     p->log = getenv("HV_PVG_LITE_LOG") != NULL;
+     p->tally = getenv("HV_PVG_TALLY") != NULL;
++    p->external = getenv("HV_PVG_EXTERNAL") && atoi(getenv("HV_PVG_EXTERNAL"));
+     hv_machine_add_mmio(m, gfx_pa, 0x10000, p, gfx_read, gfx_write, "gfx");
+     hv_machine_add_mmio(m, iosfc_pa, 0x10000, p, iosfc_read, iosfc_write, "iosurface");
+     return p;
+@@ -861,6 +956,16 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
+     memcpy(p->task_root, s->task_root, sizeof s->task_root);
+     memcpy(p->task_objects, s->task_objects, sizeof s->task_objects);
+     memcpy(p->task_placement, s->task_placement, sizeof s->task_placement);
++    /* What the guest was last told is on its display page; a size set since (another screen) follows on the next poll. */
++    const uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
++    if (d) {
++        uint32_t mode = *(const uint32_t *)(d + 0x210);
++        p->display_seq = *(const uint32_t *)(d + 0x200);
++        p->display_mode = (uint64_t)(mode & 0xffff) << 32 | mode >> 16;
++        p->display_ppmm = atomic_load(&display_ppmm);
++        p->display_gen = 0;
++        if (!d[0xfa9]) __atomic_store_n(&p->display_taken, p->display_mode, __ATOMIC_RELEASE);
++    }
+     return 0;
+ }
+ 
+diff --git a/devices/pvg_lite.h b/devices/pvg_lite.h
+index bf258507..14182ad9 100644
+--- a/devices/pvg_lite.h
++++ b/devices/pvg_lite.h
+@@ -56,6 +56,10 @@ int hv_pvg_trace_on(void);
+ /* The size macOS is told its screen is. Set before the machine starts; default 1920 x 1080. */
+ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
+ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
++/* Both at once, for a running Mac: a size and its pixels per mm (0 for the 400 mm default), told together. */
++void hv_pvg_lite_set_mode_density(uint32_t width, uint32_t height, float px_per_mm);
++/* The mode the guest acked last: 0, or -1 before it has acked one. Any thread. */
++int hv_pvg_lite_display_mode(HvPvgLite *p, uint32_t *width, uint32_t *height);
+ 
+ /* Instant resume (host/snapshot.c). State blobs: called with out NULL they return the size needed. */
+ size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap);
+diff --git a/host/vm.c b/host/vm.c
+index 04f0cfb1..869007b5 100644
+--- a/host/vm.c
++++ b/host/vm.c
+@@ -750,6 +750,11 @@ int hv_vm_pointer(int *x, int *y) {
+     return 0;
+ }
+ 
++int hv_vm_display_size(uint32_t *width, uint32_t *height) {
++    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
++    return pvg ? hv_pvg_lite_display_mode(pvg, width, height) : -1;
++}
++
+ int hv_vm_snapshot(uint8_t *bgra, int width, int height) {
+     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+     if (!pvg || width <= 0 || height <= 0) return -1;
+diff --git a/host/vm.h b/host/vm.h
+index f3f53720..fd0e2e10 100644
+--- a/host/vm.h
++++ b/host/vm.h
+@@ -102,6 +102,8 @@ void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger th
+ void hv_vm_touch_button(int down); /* the pad's full press (a click) */
+ /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
+ int hv_vm_pointer(int *x, int *y);
++/* The display mode the guest took last. 0, or -1 before it has taken one. */
++int hv_vm_display_size(uint32_t *width, uint32_t *height);
+ /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
+ int hv_vm_snapshot(uint8_t *bgra, int width, int height);
+ 
+diff --git a/ios/Henge/DisplayRouter.swift b/ios/Henge/DisplayRouter.swift
+index 47b0ced4..393771f1 100644
+--- a/ios/Henge/DisplayRouter.swift
++++ b/ios/Henge/DisplayRouter.swift
+@@ -6,6 +6,21 @@ import QuartzCore
+ @MainActor
+ final class DisplayRouter: ObservableObject {
+     @Published private(set) var isExternal = false
++    /// The Mac's screen as macOS has it now: its boot size, then whatever it took since. Nil before a Mac starts,
++    /// when the Mac's own setting says.
++    @Published private(set) var screen: Size?
++    var aspect: CGFloat? { screen.map { CGFloat($0.width) / CGFloat(max($0.height, 1)) } }
++
++    /// Whether the Mac's screen follows the space it is shown in (a Mac set to fit, or Retina). Set while it runs.
++    private var follows = false
++    private var retina = false
++    private var running = false
++    /// The size each surface would like macOS to have, in pixels: the device's own (nil key) and each external one.
++    private var wanted: [UUID?: Size] = [:]
++    private var asked: Size?
++    private var pending: Task<Void, Never>?
++
++    struct Size: Equatable { var width: Int, height: Int }
+ 
+     private var targets = DisplayTargetSelection()
+     private var layers: [UUID: CAMetalLayer] = [:]
+@@ -21,6 +36,70 @@ final class DisplayRouter: ObservableObject {
+         targets.disconnect(id)
+         updateTarget()
+         layers.removeValue(forKey: id)
++        wanted.removeValue(forKey: id)
++    }
++
++    /// A Mac is starting with this screen; `follows` says whether it may change size to the space it is shown in.
++    func begin(screen: (width: Int, height: Int), follows: Bool, retina: Bool) {
++        self.retina = retina
++        self.screen = Size(width: screen.width, height: screen.height)
++        asked = self.screen
++        self.follows = follows
++        running = false
++    }
++
++    /// macOS is up (or stopped): from now on a new size goes to it as it changes.
++    func setRunning(_ on: Bool) {
++        running = on
++        pending?.cancel()
++        if on { follow() }
++    }
++
++    /// The size the device's screen (nil) or an external display would give the Mac; nil to stop asking (upright,
++    /// zoomed, typing: the Mac keeps what it has).
++    func want(_ size: Size?, on surface: UUID? = nil) {
++        guard wanted[surface] != size else { return }
++        wanted[surface] = size
++        follow()
++    }
++
++    /// What macOS has taken, read again (the session does once a second): a size asked for before macOS was up to
++    /// take it is taken during its boot.
++    func sync() {
++        var w: UInt32 = 0, h: UInt32 = 0
++        guard running, henge_vm_display_size(&w, &h) == 0, w > 0, h > 0 else { return }
++        let taken = Size(width: Int(w), height: Int(h))
++        if taken != screen {
++            screen = taken
++            HengeLog.log("display", "macOS took \(w)x\(h)")
++            refresh()
++        }
++    }
++
++    /// Asks macOS for the selected surface's size once it has stayed the same a moment: a rotation, a window being
++    /// dragged larger or a display coming and going asks once, not at every step.
++    private func follow() {
++        guard follows, running else { return }
++        let device: UUID? = nil
++        // On an external display, its size only: until it says, the Mac keeps what it has.
++        let size = targets.isExternal ? selected.flatMap { wanted[$0] } : wanted[device]
++        pending?.cancel() // a size asked for a moment ago and not wanted now
++        guard let size, size != asked else { return }
++        pending = Task { [weak self] in
++            try? await Task.sleep(nanoseconds: 300_000_000)
++            guard let self, !Task.isCancelled else { return }
++            self.asked = size
++            // A Retina Mac keeps its panel's density on the device's own screen; an external display gets the
++            // default (1x), as macOS would pick for a desk monitor whose size it cannot know.
++            let density: Float = self.retina && !self.targets.isExternal ? Float(Device.retinaPPI / 25.4) : 0
++            HengeLog.log("display", "asking macOS for \(size.width)x\(size.height), \(density) px/mm")
++            henge_vm_set_display_live(UInt32(size.width), UInt32(size.height), density)
++            // The layout takes the new shape when macOS does, so the picture is never stretched or squeezed.
++            for _ in 0..<50 where !Task.isCancelled && self.screen != size {
++                self.sync()
++                try? await Task.sleep(nanoseconds: 100_000_000)
++            }
++        }
+     }
+ 
+     /// Re-present the latest frame after layout or a return from the background,
+@@ -35,6 +114,7 @@ final class DisplayRouter: ObservableObject {
+         if next != selected {
+             selected = next
+             sendTarget()
++            follow()
+         }
+         if isExternal != targets.isExternal { isExternal = targets.isExternal }
+     }
+@@ -44,3 +124,27 @@ final class DisplayRouter: ObservableObject {
+         henge_vm_set_display_layer(layer.map { Unmanaged.passUnretained($0).toOpaque() })
+     }
+ }
++
++extension DisplayRouter.Size {
++    /// The Mac's screen for a space of this many points at this scale. Retina: every pixel. Otherwise what
++    /// Device.fittingScreen picks for a whole device, for any shape: 1920 wide and as tall as the shape asks, or for a
++    /// space squarer than 4:3, 1440 tall and as wide as it asks.
++    static func fitting(_ points: CGSize, scale: CGFloat, retina: Bool) -> Self? {
++        guard points.width >= 100, points.height >= 100 else { return nil }
++        if retina {
++            return Self(width: Int(points.width * scale) / 8 * 8, height: Int(points.height * scale) / 8 * 8)
++        }
++        let shape = points.width / points.height
++        // Wider than 16:9 stays 1920 x 1080, beside bars, as a Mac set to fit always has on such a phone.
++        if shape >= 4.0 / 3 { return Self(width: 1920, height: max(Int((1920 / shape / 8).rounded()) * 8, 1080)) }
++        return Self(width: max(Int((1440 * shape / 8).rounded()) * 8, 800), height: 1440)
++    }
++
++    /// An external display: its own pixels, up to 2560 x 1600 (larger costs the emulated Mac more than it gives).
++    static func external(_ points: CGSize, scale: CGFloat) -> Self? {
++        guard points.width >= 100, points.height >= 100 else { return nil }
++        let px = CGSize(width: points.width * scale, height: points.height * scale)
++        let down = min(1, 2560 / px.width, 1600 / px.height)
++        return Self(width: Int(px.width * down) / 8 * 8, height: Int(px.height * down) / 8 * 8)
++    }
++}
+diff --git a/ios/Henge/ExternalMacDisplay.swift b/ios/Henge/ExternalMacDisplay.swift
+index 3f52d1fe..730088df 100644
+--- a/ios/Henge/ExternalMacDisplay.swift
++++ b/ios/Henge/ExternalMacDisplay.swift
+@@ -2,24 +2,67 @@ import SwiftUI
+ 
+ /// The accessory only presents the existing Mac's pixels. It never owns or
+ /// starts a VM, and hardware input continues through the phone's SessionView.
++/// The Mac takes the display's own shape and pixels while it is shown there (DisplayRouter).
+ struct ExternalMacDisplay: View {
+     let presentation: MacPresentation
+-    /// The id this display's view connects to the router under; a display scene passes its own.
+-    var surface = UUID()
++    /// The id this display's view connects to the router under; a display scene passes its own. Kept as state:
++    /// the accessory makes this view again at every update, and the size it asks for is filed under this id.
++    @State private var surface: UUID
++    @ObservedObject private var display: DisplayRouter
++
++    init(presentation: MacPresentation, surface: UUID = UUID()) {
++        self.presentation = presentation
++        _surface = State(initialValue: surface)
++        display = presentation.display
++    }
+ 
+     var body: some View {
+         GeometryReader { geometry in
+-            let aspect = presentation.aspect
++            let aspect = display.aspect ?? presentation.aspect
+             let width = min(geometry.size.width, geometry.size.height * aspect)
+             BootDisplay(display: presentation.display, role: .external, surface: surface)
+                 .frame(width: width, height: width / aspect)
+                 .frame(maxWidth: .infinity, maxHeight: .infinity)
++                .background(DisplayScale { scale in want(geometry.size, scale: scale) })
++                .onChange(of: geometry.size) { want($0) }
+         }
+         .background(.black)
+         .ignoresSafeArea()
+         .allowsHitTesting(false)
+         .preferredColorScheme(.dark)
+     }
++
++    @State private var scale: CGFloat = 0
++
++    private func want(_ size: CGSize, scale: CGFloat? = nil) {
++        if let scale { self.scale = scale }
++        guard self.scale > 0 else { return }
++        display.want(DisplayRouter.Size.external(size, scale: self.scale), on: surface)
++    }
++}
++
++/// The scale of the screen a view is on (an external display's own, which UIScreen.main is not), once it is on one.
++private struct DisplayScale: UIViewRepresentable {
++    let found: (CGFloat) -> Void
++
++    final class Probe: UIView {
++        var found: ((CGFloat) -> Void)?
++        override func didMoveToWindow() {
++            super.didMoveToWindow()
++            guard let screen = window?.windowScene?.screen else { return }
++            let scale = screen.nativeScale
++            DispatchQueue.main.async { [found] in found?(scale) }
++        }
++    }
++
++    func makeUIView(context: Context) -> Probe {
++        let view = Probe()
++        view.isUserInteractionEnabled = false
++        view.found = found
++        return view
++    }
++
++    func updateUIView(_ view: Probe, context: Context) { view.found = found }
+ }
+ 
+ /// Puts the session's Mac on an external display. iOS 27 delivers that scene only to this
+diff --git a/ios/Henge/Hardware.swift b/ios/Henge/Hardware.swift
+index 5a8da407..0c300f3d 100644
+--- a/ios/Henge/Hardware.swift
++++ b/ios/Henge/Hardware.swift
+@@ -31,8 +31,9 @@ enum Device {
+     }
+     static var retinaMM: (width: Int, height: Int) {
+         let s = retinaScreen
+-        return (Int((Double(s.width) / 264 * 25.4).rounded()), Int((Double(s.height) / 264 * 25.4).rounded()))
++        return (Int((Double(s.width) / retinaPPI * 25.4).rounded()), Int((Double(s.height) / retinaPPI * 25.4).rounded()))
+     }
++    static let retinaPPI = 264.0
+ 
+     /// How much memory to suggest for a new Mac: what leaves this device room for iOS.
+     static var suggestedRAMGB: Int {
+diff --git a/ios/Henge/Native/henge-vm.c b/ios/Henge/Native/henge-vm.c
+index 344d8a15..59bc46c0 100644
+--- a/ios/Henge/Native/henge-vm.c
++++ b/ios/Henge/Native/henge-vm.c
+@@ -371,6 +371,15 @@ char *henge_share_take_clipboard(void) { return hv_share_take_clipboard(); }
+ long henge_share_agent_seen(void) { return hv_share_agent_seen(); }
+ 
+ void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
++void henge_vm_set_display_live(uint32_t width, uint32_t height, float px_per_mm) {
++    hv_pvg_lite_set_mode_density(width, height, px_per_mm);
++}
++int henge_vm_display_size(uint32_t *width, uint32_t *height) {
++    if (!lock_running()) return -1;
++    int result = hv_vm_display_size(width, height);
++    pthread_rwlock_unlock(&api_lock);
++    return result;
++}
+ void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
+ 
+ void henge_vm_key(uint16_t code, int down) {
+diff --git a/ios/Henge/Native/henge-vm.h b/ios/Henge/Native/henge-vm.h
+index 4b92cae4..a436c9d4 100644
+--- a/ios/Henge/Native/henge-vm.h
++++ b/ios/Henge/Native/henge-vm.h
+@@ -76,8 +76,13 @@ void henge_share_set_clipboard(const char *text);
+ char *henge_share_take_clipboard(void);
+ long henge_share_agent_seen(void);
+ 
+-/* The size macOS is told its screen is. Before henge_vm_boot. */
++/* The size macOS is told its screen is. Before henge_vm_boot, and again whenever the space it is shown in changes:
++   a running Mac gets the new size as a new mode list and macOS switches to it. */
+ void henge_vm_set_display(uint32_t width, uint32_t height);
++/* A new size for a running Mac with its density in pixels per mm (0: the default, a ~122 ppi 1x screen). */
++void henge_vm_set_display_live(uint32_t width, uint32_t height, float px_per_mm);
++/* The size macOS took last (it acked the mode list). 0, or -1 before it has taken one. */
++int henge_vm_display_size(uint32_t *width, uint32_t *height);
+ /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
+ void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
+ void henge_vm_key(uint16_t code, int down);
+diff --git a/ios/Henge/SessionView.swift b/ios/Henge/SessionView.swift
+index 261cac1e..f3ad8aa2 100644
+--- a/ios/Henge/SessionView.swift
++++ b/ios/Henge/SessionView.swift
+@@ -56,7 +56,8 @@ struct SessionView: View {
+             let full = CGSize(width: geo.size.width + insets.leading + insets.trailing,
+                               height: geo.size.height + insets.top + insets.bottom)
+             let landscape = full.width > full.height
+-            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: mac.aspect)
++            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: aspect)
++            let space = Layout.space(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing)
+             ZStack(alignment: .topLeading) {
+                 (landscape || zoomed ? Color.black : Desk.page)
+                 // One view in every layout: it holds the layer the engine draws into.
+@@ -159,8 +160,12 @@ struct SessionView: View {
+                 controlsHidden = false
+                 showRevealHint = false
+             }
+-            .onAppear { shown = layout.shown }
++            .onAppear {
++                shown = layout.shown
++                wantSize(space)
++            }
+             .onChange(of: layout.shown) { shown = $0 }
++            .onChange(of: space) { wantSize($0) }
+         }
+         .statusBarHidden(zoomed || Device.isPad)
+         .persistentSystemOverlays(.hidden)
+@@ -211,6 +216,17 @@ struct SessionView: View {
+         .task { await Sharing.followMacClipboard() }
+     }
+ 
++    /// The shape of the Mac's screen now: what macOS took last, which can differ from the Mac's setting once it
++    /// follows the space it is shown in.
++    private var aspect: CGFloat { display.aspect ?? mac.aspect }
++    private var macScreen: (width: Int, height: Int) { display.screen.map { ($0.width, $0.height) } ?? mac.screen }
++
++    /// The Mac's screen follows the space it has on this device: a rotation, a fold or unfold, a window resized.
++    private func wantSize(_ space: CGSize?) {
++        let scale = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen.scale }.first ?? 2
++        display.want(space.flatMap { DisplayRouter.Size.fitting($0, scale: scale, retina: mac.isRetina) })
++    }
++
+     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
+     private var pointerNeeded: Bool { state == 2 || showDetails || confirmStop || error != nil }
+ 
+@@ -230,6 +246,14 @@ struct SessionView: View {
+             CGSize(width: min(touch.width / max(screen.width, 1), 1), height: min(touch.height / max(screen.height, 1), 1))
+         }
+ 
++        /// The space the Mac's screen could fill, whatever its shape: on its side, not zoomed in and not typing.
++        /// Elsewhere nil, and the Mac keeps the shape it has (upright, it sits small above the trackpad).
++        static func space(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool) -> CGSize? {
++            guard landscape, !zoomed, !typing else { return nil }
++            let side = Device.isPad && full.height >= 600 ? 2 * max(insets.leading, insets.trailing) : 0
++            return CGSize(width: full.width - side, height: full.height)
++        }
++
+         init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint, aspect: CGFloat) {
+             self.insets = insets
+             let big = full.height >= 600 // an iPad on its side, or a window on one
+@@ -409,7 +433,7 @@ struct SessionView: View {
+ 
+     /// The whole screen, small, with where the zoomed view is on it.
+     private func zoomMap(_ layout: Layout) -> some View {
+-        let width: CGFloat = 112, height = width / mac.aspect
++        let width: CGFloat = 112, height = width / aspect
+         let viewW = min(layout.touch.width / layout.screen.width, 1) * width
+         let viewH = min(layout.touch.height / layout.screen.height, 1) * height
+         let left = (-layout.screen.minX / layout.screen.width) * width
+@@ -435,9 +459,9 @@ struct SessionView: View {
+         while !Task.isCancelled {
+             var x: Int32 = 0, y: Int32 = 0
+             if henge_vm_pointer(&x, &y) == 0 {
+-                moveZoom(toward: CGPoint(x: CGFloat(x) / CGFloat(mac.screen.width), y: CGFloat(y) / CGFloat(mac.screen.height)))
++                moveZoom(toward: CGPoint(x: CGFloat(x) / CGFloat(macScreen.width), y: CGFloat(y) / CGFloat(macScreen.height)))
+             }
+-            if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / mac.aspect)) { map = UIImage(cgImage: image) }
++            if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / aspect)) { map = UIImage(cgImage: image) }
+             tick += 1
+             try? await Task.sleep(nanoseconds: 33_000_000)
+         }
+@@ -605,6 +629,8 @@ struct SessionView: View {
+             henge_vm_set_display_mm(0, 0)
+         }
+         HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
++        // Fit and Retina follow the space the Mac is shown in; a size picked for speed or 16:9 stays as picked.
++        display.begin(screen: mac.screen, follows: mac.isRetina || mac.screen == Device.fittingScreen, retina: mac.isRetina)
+         var rc: Int32 = -1
+         if InstantResume.enabled, let at = InstantResume.saved(for: mac, ramMB: ram, cpus: cpus) {
+             HengeLog.log("resume", "picking up the Mac saved \(Int(Date().timeIntervalSince(at))) s ago")
+@@ -628,6 +654,7 @@ struct SessionView: View {
+         }
+         bootRAM = ram
+         started = Date()
++        display.setRunning(true)
+         var used = mac
+         used.lastUsed = started
+         Machines.shared.update(used)
+@@ -657,6 +684,7 @@ struct SessionView: View {
+                 HengeLog.log("session", "thermal state: \(Self.thermalLabel(heat))")
+             }
+             if state == 2 {
++                display.setRunning(false)
+                 typing = false
+                 showDetails = false
+                 confirmStop = false
+@@ -671,6 +699,7 @@ struct SessionView: View {
+                 }
+                 break
+             }
++            display.sync()
+             tick += 1
+             if tick % 10 == 0 {
+                 let gpuFrames = henge_vm_gpu_frames()

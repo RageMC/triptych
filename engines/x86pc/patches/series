@@ -1,0 +1,4 @@
+# Triptych patches on top of upstreams/qemu (utmapp/qemu tag v10.0.12-utm).
+# Applied in order by scripts/build-x86pc.sh with `patch -p1` into a scratch copy (build/x86pc/qemu-src); empty = none needed yet.
+0001-ui-triptych-display-backend.patch
+0002-license-gpl2-or-later-clean.patch

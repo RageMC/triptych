@@ -1,0 +1,475 @@
+diff -Naur a/include/ui/triptych.h b/include/ui/triptych.h
+--- a/include/ui/triptych.h
++++ b/include/ui/triptych.h
+@@ -0,0 +1,42 @@
++/*
++ * Triptych display backend: the embedding app (an iOS/macOS process that loaded libqemu-*-softmmu) pulls the guest
++ * framebuffer and injects keyboard/pointer input through these C functions. Select it with `-display triptych`.
++ * Plain C, no QEMU types, so the app can declare these prototypes itself (it reaches them with dlsym).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef UI_TRIPTYCH_H
++#define UI_TRIPTYCH_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++/* Frame pull, safe from any thread. The backend keeps a private x8r8g8b8 shadow (bytes B,G,R,X in memory) guarded by
++ * a mutex and never hands out a pointer to it: the app copies the frame out under that lock.
++ * Returns 0 when nothing changed since *seq (or no surface yet). Otherwise sets *w, *h, *stride (bytes) and returns
++ * the frame size in bytes; the pixels were copied into dst and *seq updated only if cap is large enough, so a caller
++ * with a smaller buffer (or dst NULL, cap 0, to just ask the size) reallocates from the returned size and calls again. */
++size_t triptych_display_copy(void *dst, size_t cap, int *w, int *h, int *stride, uint64_t *seq);
++
++/* Input: safe from any thread, ignored until the display is up; events are queued and delivered on the main-loop
++ * thread. usb = USB HID keyboard usage (UIKeyboardHIDUsage raw value), translated to a QKeyCode with QEMU's
++ * usb->qcode table. qcode = QKeyCode enum value; name = QKeyCode name ("ret", "a", "shift"...), returns -1 if unknown.
++ * text: ASCII characters (letters, digits, US punctuation, ' ', '\n', '\t') typed as press+release with shift where
++ * needed; returns the number of characters consumed. Pointer: abs coordinates in 0..max (any range, scaled by QEMU to
++ * the guest device), buttons bit0 = left, bit1 = middle, bit2 = right; needs an absolute pointer device in the guest
++ * (-device virtio-tablet-pci); rel is for PS/2 or virtio-mouse. */
++int  triptych_input_key_usb(int usb, int down);     /* 0 when the usage has no QKeyCode */
++void triptych_input_key(int qcode, int down);
++int  triptych_input_key_name(const char *name, int down);
++int  triptych_input_text(const char *text);
++void triptych_input_pointer_abs(int x, int y, int max_x, int max_y, unsigned buttons);
++void triptych_input_pointer_rel(int dx, int dy, unsigned buttons);
++
++/* Unregisters the display listener and asks QEMU to shut down (host-ui cause) from the main loop; qemu_main_loop then
++ * returns, and the embedder joins its QEMU thread instead of letting QEMU call exit(). */
++void triptych_display_shutdown(void);
++
++/* Statistics for tests: surfaces switched and update rectangles received so far. */
++void triptych_display_stats(uint64_t *switches, uint64_t *updates);
++
++#endif
+diff -Naur a/qapi/ui.json b/qapi/ui.json
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1505,6 +1505,9 @@
+ #
+ # @dbus: Start a D-Bus service for the display.  (Since 7.0)
+ #
++# @triptych: Hand frames to the embedding app through C callbacks
++#     (include/ui/triptych.h) and take input from it.  (Triptych)
++#
+ # Since: 2.12
+ ##
+ { 'enum'    : 'DisplayType',
+@@ -1518,7 +1521,8 @@
+     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
+     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
+     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
+-    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
++    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
++    { 'name': 'triptych' }
+   ]
+ }
+ 
+diff -Naur a/system/qemu.symbols b/system/qemu.symbols
+--- a/system/qemu.symbols
++++ b/system/qemu.symbols
+@@ -8,4 +8,13 @@
+   qemu_thread_create;
+   replay_mutex_lock;
+   replay_mutex_unlock;
++  triptych_display_copy;
++  triptych_display_stats;
++  triptych_display_shutdown;
++  triptych_input_key_usb;
++  triptych_input_key;
++  triptych_input_key_name;
++  triptych_input_text;
++  triptych_input_pointer_abs;
++  triptych_input_pointer_rel;
+ };
+diff -Naur a/ui/meson.build b/ui/meson.build
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -15,6 +15,7 @@
+   'kbd-state.c',
+   'keymaps.c',
+   'qemu-pixman.c',
++  'triptych.c',
+   'ui-hmp-cmds.c',
+   'ui-qmp-cmds.c',
+   'util.c',
+diff -Naur a/ui/triptych.c b/ui/triptych.c
+--- a/ui/triptych.c
++++ b/ui/triptych.c
+@@ -0,0 +1,374 @@
++/*
++ * Triptych display backend (see include/ui/triptych.h).
++ *
++ * Keeps a private x8r8g8b8 shadow of the console surface (converted with pixman when the device surface has another
++ * format) behind a mutex. The app pulls frames with triptych_display_copy(), which copies under that lock, so a frame
++ * is never read while the shadow is being replaced or updated. App input events are queued and fed into QEMU's input
++ * layer from a main-loop bottom half (the app may call the input functions from any thread).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qemu/thread.h"
++#include "qemu/atomic.h"
++#include "qapi/util.h"
++#include "qapi/qapi-types-ui.h"
++#include "qapi/qapi-types-run-state.h"
++#include "system/runstate.h"
++#include "ui/console.h"
++#include "ui/input.h"
++#include "ui/qemu-pixman.h"
++#include "ui/triptych.h"
++#include "block/aio.h"
++
++static bool ready;                  /* display listener registered and the main loop is running */
++
++/* Main-loop-only state */
++static DisplayChangeListener *tdcl;
++static DisplaySurface *cur_surface;
++
++/* Shadow: shadow_lock guards shadow, shadow_seq and the pixels. A replacement shadow is built outside the lock and
++ * swapped in under it, the old one is released after the lock is dropped. */
++static QemuMutex shadow_lock;
++static pixman_image_t *shadow;      /* x8r8g8b8 copy handed to the app (by copy only) */
++static uint64_t shadow_seq;
++static uint64_t n_switches, n_updates;
++
++static void shadow_sync(int x, int y, int w, int h)
++{
++    if (!cur_surface) {
++        return;
++    }
++    qemu_mutex_lock(&shadow_lock);
++    if (shadow) {
++        pixman_image_composite(PIXMAN_OP_SRC, cur_surface->image, NULL, shadow, x, y, 0, 0, x, y, w, h);
++        shadow_seq++;
++    }
++    n_updates++;
++    qemu_mutex_unlock(&shadow_lock);
++}
++
++static void triptych_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface)
++{
++    pixman_image_t *fresh = NULL, *old;
++
++    cur_surface = new_surface;
++    if (new_surface) {
++        int w = surface_width(new_surface), h = surface_height(new_surface);
++        fresh = pixman_image_create_bits(PIXMAN_x8r8g8b8, w, h, NULL, 0);
++        if (fresh) {
++            pixman_image_composite(PIXMAN_OP_SRC, new_surface->image, NULL, fresh, 0, 0, 0, 0, 0, 0, w, h);
++        }
++    }
++    qemu_mutex_lock(&shadow_lock);
++    old = shadow;
++    shadow = fresh;
++    shadow_seq++;
++    n_switches++;
++    qemu_mutex_unlock(&shadow_lock);
++    if (old) {
++        pixman_image_unref(old);
++    }
++}
++
++static void triptych_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h)
++{
++    shadow_sync(x, y, w, h);
++}
++
++static void triptych_refresh(DisplayChangeListener *dcl)
++{
++    graphic_hw_update(dcl->con);
++}
++
++static const DisplayChangeListenerOps dcl_ops = {
++    .dpy_name             = "triptych",
++    .dpy_refresh          = triptych_refresh,
++    .dpy_gfx_update       = triptych_gfx_update,
++    .dpy_gfx_switch       = triptych_gfx_switch,
++    .dpy_gfx_check_format = qemu_pixman_check_format,
++};
++
++static void triptych_display_init(DisplayState *ds, DisplayOptions *opts)
++{
++    tdcl = g_new0(DisplayChangeListener, 1);
++    tdcl->con = qemu_console_lookup_default();
++    tdcl->ops = &dcl_ops;
++    register_displaychangelistener(tdcl);
++    qatomic_set(&ready, true);
++}
++
++static QemuDisplay qemu_display_triptych = {
++    .type = DISPLAY_TYPE_TRIPTYCH,
++    .init = triptych_display_init,
++};
++
++static QemuMutex q_lock;            /* input queue lock, see the input section */
++
++static void register_triptych(void)
++{
++    qemu_mutex_init(&shadow_lock);
++    qemu_mutex_init(&q_lock);
++    qemu_display_register(&qemu_display_triptych);
++}
++type_init(register_triptych);
++
++size_t triptych_display_copy(void *dst, size_t cap, int *w, int *h, int *stride, uint64_t *seq)
++{
++    size_t need = 0;
++
++    if (!qatomic_read(&ready) || !w || !h || !stride || !seq) {
++        return 0;
++    }
++    qemu_mutex_lock(&shadow_lock);
++    if (shadow && shadow_seq != *seq) {
++        *w = pixman_image_get_width(shadow);
++        *h = pixman_image_get_height(shadow);
++        *stride = pixman_image_get_stride(shadow);
++        need = (size_t)*stride * *h;
++        if (dst && need <= cap) {
++            memcpy(dst, pixman_image_get_data(shadow), need);
++            *seq = shadow_seq;
++        }
++    }
++    qemu_mutex_unlock(&shadow_lock);
++    return need;
++}
++
++void triptych_display_stats(uint64_t *switches, uint64_t *updates)
++{
++    bool up = qatomic_read(&ready);
++
++    if (up) {
++        qemu_mutex_lock(&shadow_lock);
++    }
++    if (switches) {
++        *switches = up ? n_switches : 0;
++    }
++    if (updates) {
++        *updates = up ? n_updates : 0;
++    }
++    if (up) {
++        qemu_mutex_unlock(&shadow_lock);
++    }
++}
++
++/* ---- shutdown ---- */
++
++static void shutdown_bh(void *opaque)
++{
++    pixman_image_t *old;
++
++    qatomic_set(&ready, false);
++    if (tdcl) {
++        unregister_displaychangelistener(tdcl);
++        g_free(tdcl);
++        tdcl = NULL;
++    }
++    cur_surface = NULL;
++    qemu_mutex_lock(&shadow_lock);
++    old = shadow;
++    shadow = NULL;
++    qemu_mutex_unlock(&shadow_lock);
++    if (old) {
++        pixman_image_unref(old);
++    }
++    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
++}
++
++void triptych_display_shutdown(void)
++{
++    if (qatomic_read(&ready)) {
++        aio_bh_schedule_oneshot(qemu_get_aio_context(), shutdown_bh, NULL);
++    }
++}
++
++/* ---- input ---- */
++
++enum { EV_KEY, EV_ABS, EV_REL };
++typedef struct TEvent {
++    int kind, a, b, c, d;
++    unsigned buttons;
++} TEvent;
++
++static TEvent *q_ev;
++static size_t q_len, q_cap;
++static bool q_scheduled;
++static unsigned last_buttons;
++
++static void deliver_buttons(unsigned buttons)
++{
++    static const struct { unsigned bit; InputButton btn; } map[] = {
++        { 1, INPUT_BUTTON_LEFT }, { 2, INPUT_BUTTON_MIDDLE }, { 4, INPUT_BUTTON_RIGHT },
++    };
++    unsigned changed = buttons ^ last_buttons;
++    for (size_t i = 0; i < ARRAY_SIZE(map); i++) {
++        if (changed & map[i].bit) {
++            qemu_input_queue_btn(NULL, map[i].btn, !!(buttons & map[i].bit));
++        }
++    }
++    last_buttons = buttons;
++}
++
++static void input_bh(void *opaque)
++{
++    TEvent *ev;
++    size_t n;
++
++    qemu_mutex_lock(&q_lock);
++    ev = q_ev; n = q_len;
++    q_ev = NULL; q_len = q_cap = 0; q_scheduled = false;
++    qemu_mutex_unlock(&q_lock);
++
++    for (size_t i = 0; i < n && qatomic_read(&ready); i++) {
++        switch (ev[i].kind) {
++        case EV_KEY:
++            qemu_input_event_send_key_qcode(NULL, ev[i].a, ev[i].b);
++            break;
++        case EV_ABS:
++            qemu_input_queue_abs(NULL, INPUT_AXIS_X, ev[i].a, 0, ev[i].c);
++            qemu_input_queue_abs(NULL, INPUT_AXIS_Y, ev[i].b, 0, ev[i].d);
++            deliver_buttons(ev[i].buttons);
++            qemu_input_event_sync();
++            break;
++        case EV_REL:
++            if (ev[i].a) {
++                qemu_input_queue_rel(NULL, INPUT_AXIS_X, ev[i].a);
++            }
++            if (ev[i].b) {
++                qemu_input_queue_rel(NULL, INPUT_AXIS_Y, ev[i].b);
++            }
++            deliver_buttons(ev[i].buttons);
++            qemu_input_event_sync();
++            break;
++        }
++    }
++    g_free(ev);
++}
++
++static void push(TEvent e)
++{
++    if (!qatomic_read(&ready)) {   /* no main loop yet, or shut down */
++        return;
++    }
++    qemu_mutex_lock(&q_lock);
++    if (q_len == q_cap) {
++        q_cap = q_cap ? q_cap * 2 : 64;
++        q_ev = g_renew(TEvent, q_ev, q_cap);
++    }
++    q_ev[q_len++] = e;
++    if (!q_scheduled) {
++        q_scheduled = true;
++        aio_bh_schedule_oneshot(qemu_get_aio_context(), input_bh, NULL);
++    }
++    qemu_mutex_unlock(&q_lock);
++}
++
++void triptych_input_key(int qcode, int down)
++{
++    if (qcode <= Q_KEY_CODE_UNMAPPED || qcode >= Q_KEY_CODE__MAX) {
++        return;
++    }
++    push((TEvent){ .kind = EV_KEY, .a = qcode, .b = !!down });
++}
++
++int triptych_input_key_usb(int usb, int down)
++{
++    int q;
++
++    if (usb <= 0 || (guint)usb >= qemu_input_map_usb_to_qcode_len) {
++        return 0;
++    }
++    q = qemu_input_map_usb_to_qcode[usb];
++    if (q <= Q_KEY_CODE_UNMAPPED) {
++        return 0;
++    }
++    triptych_input_key(q, down);
++    return q;
++}
++
++int triptych_input_key_name(const char *name, int down)
++{
++    int q = qapi_enum_parse(&QKeyCode_lookup, name, -1, NULL);
++    if (q < 0) {
++        return -1;
++    }
++    triptych_input_key(q, down);
++    return q;
++}
++
++/* US layout: character -> (qcode, needs shift) */
++static int ascii_qcode(char c, bool *shift)
++{
++    static const char *plain = "`1234567890-=[]\\;',./";
++    static const char *shifted = "~!@#$%^&*()_+{}|:\"<>?";
++    static const int sym_q[] = {
++        Q_KEY_CODE_GRAVE_ACCENT, Q_KEY_CODE_1, Q_KEY_CODE_2, Q_KEY_CODE_3, Q_KEY_CODE_4, Q_KEY_CODE_5,
++        Q_KEY_CODE_6, Q_KEY_CODE_7, Q_KEY_CODE_8, Q_KEY_CODE_9, Q_KEY_CODE_0, Q_KEY_CODE_MINUS, Q_KEY_CODE_EQUAL,
++        Q_KEY_CODE_BRACKET_LEFT, Q_KEY_CODE_BRACKET_RIGHT, Q_KEY_CODE_BACKSLASH, Q_KEY_CODE_SEMICOLON,
++        Q_KEY_CODE_APOSTROPHE, Q_KEY_CODE_COMMA, Q_KEY_CODE_DOT, Q_KEY_CODE_SLASH,
++    };
++    const char *p;
++
++    *shift = false;
++    /* QKeyCode letters follow keyboard order, not the alphabet: look them up by name ("a".."z", "0".."9") */
++    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
++        char name[2] = { c, 0 };
++        return qapi_enum_parse(&QKeyCode_lookup, name, -1, NULL);
++    }
++    if (c >= 'A' && c <= 'Z') {
++        char name[2] = { c - 'A' + 'a', 0 };
++        *shift = true;
++        return qapi_enum_parse(&QKeyCode_lookup, name, -1, NULL);
++    }
++    switch (c) {
++    case ' ':  return Q_KEY_CODE_SPC;
++    case '\n': return Q_KEY_CODE_RET;
++    case '\t': return Q_KEY_CODE_TAB;
++    case 27:   return Q_KEY_CODE_ESC;
++    case 8: case 127: return Q_KEY_CODE_BACKSPACE;
++    }
++    if ((p = strchr(plain, c)) && c) {
++        return sym_q[p - plain];
++    }
++    if ((p = strchr(shifted, c)) && c) {
++        *shift = true;
++        return sym_q[p - shifted];
++    }
++    return -1;
++}
++
++int triptych_input_text(const char *text)
++{
++    int n = 0;
++    for (; *text; text++) {
++        bool shift;
++        int q = ascii_qcode(*text, &shift);
++        if (q < 0) {
++            continue;
++        }
++        if (shift) {
++            triptych_input_key(Q_KEY_CODE_SHIFT, 1);
++        }
++        triptych_input_key(q, 1);
++        triptych_input_key(q, 0);
++        if (shift) {
++            triptych_input_key(Q_KEY_CODE_SHIFT, 0);
++        }
++        n++;
++    }
++    return n;
++}
++
++void triptych_input_pointer_abs(int x, int y, int max_x, int max_y, unsigned buttons)
++{
++    push((TEvent){ .kind = EV_ABS, .a = x, .b = y, .c = max_x > 0 ? max_x : 1, .d = max_y > 0 ? max_y : 1,
++                   .buttons = buttons });
++}
++
++void triptych_input_pointer_rel(int dx, int dy, unsigned buttons)
++{
++    push((TEvent){ .kind = EV_REL, .a = dx, .b = dy, .buttons = buttons });
++}

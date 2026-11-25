@@ -1,0 +1,18 @@
+--- a/kernel/uname.c
++++ b/kernel/uname.c
+@@ -10,10 +10,12 @@
+ const char *uname_version = "Block Emulation";
+ const char *uname_hostname_override = NULL;
+ 
++// Triptych: the guest never sees the host's name (a Mac's or device's name is
++// personal). It reports a fixed neutral name unless the embedder overrides it.
++const char *uname_default_hostname = "triptych";
++
+ void do_uname(struct uname *uts) {
+-    struct utsname real_uname;
+-    uname(&real_uname);
+-    const char *hostname = real_uname.nodename;
++    const char *hostname = uname_default_hostname;
+     if (uname_hostname_override)
+         hostname = uname_hostname_override;
+ 

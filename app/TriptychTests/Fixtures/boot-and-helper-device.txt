@@ -1,0 +1,4 @@
+[ 72332.49ms][jit] JIT prewarm FAILED -- StikDebug is not servicing traps
+[    60.14ms][prev] henge: debug service x0=ffff9a0479408800 x1=60 x2=4d x16=1 | s0 "DriverEntry failed 0xc00000bb for driver \REGISTRY\MACHINE\SYSTEM\ControlSet001\Services\uiomap."
+BdsDxe: failed to start Boot0002 "UEFI WinVM WinVM USB CD-ROM WINVMSD0001" from PciRoot(0x0)/Pci(0x2,0x0)/USB(0x2,0x0): Time out
+BdsDxe: failed to load Boot0003 "UEFI winarm NVMe Controller WINARM0001 1" from PciRoot(0x0)/Pci(0x1,0x0)/NVMe(0x1,00-00-00-00-00-00-00-00): Not Found

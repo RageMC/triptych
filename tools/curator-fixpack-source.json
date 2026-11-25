@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "fixes": [
+    {
+      "id": "jit-region-small-cache",
+      "signature": "jit-region",
+      "title": "Use a 512 MB code cache",
+      "summary": "A smaller code cache fits in a lower address range where translated code can run. Takes effect after you quit and reopen Triptych with JIT.",
+      "source": "docs/KNOWN-FIXES.md (Henge #11, #70); Triage jit-region",
+      "changes": [
+        { "key": "henge.perf.codeCacheMB", "value": 512 }
+      ]
+    },
+    {
+      "id": "jit-required-launch",
+      "signature": "jit-required",
+      "title": "Turn on JIT when Triptych opens",
+      "summary": "Translated code needs JIT. This asks the paired helper to enable it at every launch.",
+      "source": "Triage jit-required",
+      "changes": [
+        { "key": "henge.jit.autoEnable", "value": true }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,293 @@
+diff --git a/Makefile b/Makefile
+index 8e61e553..b4aa9443 100644
+--- a/Makefile
++++ b/Makefile
+@@ -264,3 +264,11 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
+ test-jit-advice: $(B)/test_jit_advice
+ 	$(B)/test_jit_advice
+ .PHONY: test-jit-advice
++
++# Which RemotePairing result the JIT setup takes: this device's own (loopback) over another device's on the network.
++$(B)/test_remote_pairing_choice: ios/HengeJITHelper/RemotePairingChoice.swift tests/test_remote_pairing_choice.swift | $(B)
++	xcrun --sdk macosx swiftc $^ -o $@
++
++test-remote-pairing-choice: $(B)/test_remote_pairing_choice
++	$(B)/test_remote_pairing_choice
++.PHONY: test-remote-pairing-choice
+diff --git a/ios/Henge/JIT/JITSetup.swift b/ios/Henge/JIT/JITSetup.swift
+index 2818e5d7..86affd4d 100644
+--- a/ios/Henge/JIT/JITSetup.swift
++++ b/ios/Henge/JIT/JITSetup.swift
+@@ -581,6 +581,9 @@ enum RemotePairingPortDiscovery {
+         var finished = false
+         var resolvedPort: UInt16?
+         var pendingConnection: NWConnection?
++        var firstResultAt: Date?
++        var waitScheduled = false
++        var latestResults: [NWBrowser.Result] = []
+ 
+         func finish(_ port: UInt16?) {
+             resultLock.lock()
+@@ -598,23 +601,41 @@ enum RemotePairingPortDiscovery {
+             return finished
+         }
+ 
+-        browser.browseResultsChangedHandler = { results, _ in
++        // Other devices on the network advertise RemotePairing too; only this device's own (loopback) will do,
++        // unless none turns up within RemotePairingChoice.loopbackWait.
++        func evaluate() {
+             guard !hasFinished() else { return }
+-
+-            let preferred = results.first { result in
+-                result.interfaces.contains { $0.name == "lo0" }
+-            } ?? results.first
+-            guard let result = preferred, case .service = result.endpoint else { return }
+-
+             resultLock.lock()
+-            let alreadyConnecting = pendingConnection != nil
+-            if !alreadyConnecting {
+-                pendingConnection = NWConnection(to: result.endpoint, using: parameters)
++            let services = latestResults.filter { if case .service = $0.endpoint { return true } else { return false } }
++            if firstResultAt == nil, !services.isEmpty { firstResultAt = Date() }
++            let waited = firstResultAt.map { Date().timeIntervalSince($0) } ?? 0
++            let decision = RemotePairingChoice.choose(
++                interfaces: services.map { $0.interfaces.map(\.name) }, waited: waited)
++            var chosen: NWBrowser.Result?
++            switch decision {
++            case .none:
++                break
++            case .wait:
++                if !waitScheduled {
++                    waitScheduled = true
++                    queue.asyncAfter(deadline: .now() + RemotePairingChoice.loopbackWait) { evaluate() }
++                }
++            case .loopback(let index), .fallback(let index):
++                if pendingConnection == nil { chosen = services[index] }
++            }
++            var connection: NWConnection?
++            if let chosen {
++                pendingConnection = NWConnection(to: chosen.endpoint, using: parameters)
++                connection = pendingConnection
+             }
+-            let connection = pendingConnection
+             resultLock.unlock()
+ 
+-            guard !alreadyConnecting, let connection else { return }
++            guard let chosen, let connection else { return }
++            let loopback: Bool
++            if case .loopback = decision { loopback = true } else { loopback = false }
++            HengeLog.log("jit", "RemotePairing result chosen: \(chosen.endpoint) on "
++                        + chosen.interfaces.map(\.name).joined(separator: ",")
++                        + (loopback ? " (loopback)" : " (no loopback result within \(RemotePairingChoice.loopbackWait)s)"))
+ 
+             connection.stateUpdateHandler = { state in
+                 switch state {
+@@ -634,6 +655,13 @@ enum RemotePairingPortDiscovery {
+             connection.start(queue: queue)
+         }
+ 
++        browser.browseResultsChangedHandler = { results, _ in
++            resultLock.lock()
++            latestResults = Array(results)
++            resultLock.unlock()
++            evaluate()
++        }
++
+         browser.stateUpdateHandler = { state in
+             switch state {
+             case .failed, .cancelled:
+diff --git a/ios/HengeJITHelper/RSDPortResolver.swift b/ios/HengeJITHelper/RSDPortResolver.swift
+index d37025a9..8cb2c22d 100644
+--- a/ios/HengeJITHelper/RSDPortResolver.swift
++++ b/ios/HengeJITHelper/RSDPortResolver.swift
+@@ -8,7 +8,8 @@ import dnssd
+ /// 49152 StikJIT falls back to is closed then, so every attempt times out at 10.7.0.1:49152. Henge's own lookup
+ /// (RemotePairingPortDiscovery) connects to the service to learn its port, and on some devices that never
+ /// becomes ready. This reads the port from the service's SRV record with DNSServiceResolve instead, which
+-/// needs no connection.
++/// needs no connection. Other devices on the network advertise the same service, so it takes the result on the
++/// loopback interface, which is this device's own (see RemotePairingChoice).
+ enum RSDPortResolver {
+     struct Result {
+         var port: UInt16?
+@@ -40,9 +41,10 @@ enum RSDPortResolver {
+             DNSServiceRefDeallocate(browseRef)
+             state.resolveRefs.forEach(DNSServiceRefDeallocate)
+             state.resolveRefs.removeAll()
++            if !found { state.choose(final: true) }
+             state.finished = true
+-            if found, let port = state.port {
+-                return Result(port: port, detail: "resolved \(serviceType) to port \(port) on \(state.host ?? "?")")
++            if let port = state.port {
++                return Result(port: port, detail: "resolved \(serviceType) to port \(port) on \(state.host ?? "?") via \(state.chosenNote)")
+             }
+             var detail = "no port within \(Int(timeout))s: \(state.seen) service(s) seen"
+             if let error = state.lastError { detail += ", last error \(describe(error))" }
+@@ -58,13 +60,42 @@ enum RSDPortResolver {
+         var seen = 0
+         var port: UInt16?
+         var host: String?
++        var chosenNote = ""
+         var lastError: DNSServiceErrorType?
+         var finished = false
++        var candidates: [(port: UInt16, host: String, interface: String)] = []
++        var firstResultAt: Date?
++        var waitScheduled = false
+ 
+-        func finish(port: UInt16, host: String) {
+-            guard self.port == nil, !finished else { return }
+-            self.port = port
+-            self.host = host
++        func add(port: UInt16, host: String, interface: String) {
++            if firstResultAt == nil { firstResultAt = Date() }
++            candidates.append((port, host, interface))
++            choose(final: false)
++        }
++
++        /// `final` is the overall timeout: use what there is rather than nothing.
++        func choose(final: Bool) {
++            guard port == nil, !finished else { return }
++            let waited = final ? .infinity : Date().timeIntervalSince(firstResultAt ?? Date())
++            let decision = RemotePairingChoice.choose(interfaces: candidates.map { [$0.interface] }, waited: waited)
++            switch decision {
++            case .none:
++                return
++            case .wait:
++                guard !waitScheduled, let queue else { return }
++                waitScheduled = true
++                queue.asyncAfter(deadline: .now() + RemotePairingChoice.loopbackWait) { [self] in choose(final: false) }
++            case .loopback(let index):
++                take(index, note: "loopback interface \(candidates[index].interface)")
++            case .fallback(let index):
++                take(index, note: "\(candidates[index].interface), no loopback result within \(RemotePairingChoice.loopbackWait)s")
++            }
++        }
++
++        private func take(_ index: Int, note: String) {
++            port = candidates[index].port
++            host = candidates[index].host
++            chosenNote = note
+             done.signal()
+         }
+     }
+@@ -89,7 +120,7 @@ enum RSDPortResolver {
+         DNSServiceSetDispatchQueue(resolveRef, queue)
+     }
+ 
+-    private static let resolveCallback: DNSServiceResolveReply = { _, _, _, error, _, host, port, _, _, context in
++    private static let resolveCallback: DNSServiceResolveReply = { _, _, interface, error, _, host, port, _, _, context in
+         guard let context else { return }
+         let state = Unmanaged<State>.fromOpaque(context).takeUnretainedValue()
+         guard error == kDNSServiceErr_NoError else {
+@@ -99,7 +130,9 @@ enum RSDPortResolver {
+         // The port arrives in network byte order.
+         let value = UInt16(bigEndian: port)
+         guard value != 0 else { return }
+-        state.finish(port: value, host: host.map { String(cString: $0) } ?? "?")
++        var nameBuffer = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
++        let interfaceName = if_indextoname(interface, &nameBuffer).map { String(cString: $0) } ?? "if\(interface)"
++        state.add(port: value, host: host.map { String(cString: $0) } ?? "?", interface: interfaceName)
+     }
+ 
+     private static func describe(_ error: DNSServiceErrorType) -> String {
+diff --git a/ios/HengeJITHelper/RemotePairingChoice.swift b/ios/HengeJITHelper/RemotePairingChoice.swift
+new file mode 100644
+index 00000000..3790a279
+--- /dev/null
++++ b/ios/HengeJITHelper/RemotePairingChoice.swift
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++import Foundation
++
++/// Which `_remotepairing._tcp` result to use. Compiled into both Henge and its JIT helper.
++///
++/// Every device on the Wi-Fi can advertise that service (an Apple TV did, on port 49152), and the first
++/// result to arrive is not always this phone's. The phone's own service comes in on the loopback
++/// interface, so a loopback result wins; a result on another interface is only used if none shows up in time.
++/// StikDebug makes the same choice (https://github.com/StikDebug/StikDebug, JITEnableContext.swift).
++enum RemotePairingChoice {
++    /// How long after the first result to hold out for a loopback one. The phone's own advertisement is
++    /// answered locally, so it normally lands within moments of the first result; the helper gives up
++    /// after 4 s and Henge's own lookup after 3 s, so this leaves room to connect to whatever is chosen.
++    static let loopbackWait: TimeInterval = 1.5
++
++    enum Decision: Equatable {
++        case none
++        case wait
++        case loopback(Int)
++        case fallback(Int)
++    }
++
++    /// `interfaces` holds, for each result so far in arrival order, the names of the interfaces it came in on.
++    /// `waited` is the time since the first result arrived.
++    static func choose(interfaces: [[String]], waited: TimeInterval) -> Decision {
++        if interfaces.isEmpty { return .none }
++        if let index = interfaces.firstIndex(where: { $0.contains(where: isLoopback) }) {
++            return .loopback(index)
++        }
++        return waited >= loopbackWait ? .fallback(0) : .wait
++    }
++
++    static func isLoopback(_ interfaceName: String) -> Bool {
++        interfaceName.hasPrefix("lo")
++    }
++}
+diff --git a/ios/project.yml b/ios/project.yml
+index 8a9eb26c..e9acbcde 100644
+--- a/ios/project.yml
++++ b/ios/project.yml
+@@ -41,6 +41,8 @@ targets:
+         buildPhase: resources
+       # The messages the app and its JIT helper exchange.
+       - path: HengeJITHelper/HengeJITMessages.swift
++      # Which RemotePairing result is this device's own.
++      - path: HengeJITHelper/RemotePairingChoice.swift
+     settings:
+       base:
+         PRODUCT_BUNDLE_IDENTIFIER: $(HENGE_BUNDLE_IDENTIFIER)
+diff --git a/tests/test_remote_pairing_choice.swift b/tests/test_remote_pairing_choice.swift
+new file mode 100644
+index 00000000..18ffdff3
+--- /dev/null
++++ b/tests/test_remote_pairing_choice.swift
+@@ -0,0 +1,40 @@
++import Foundation
++
++@main
++struct RemotePairingChoiceTests {
++    static func main() {
++        let wait = RemotePairingChoice.loopbackWait
++
++        // Situation: no results yet.
++        precondition(RemotePairingChoice.choose(interfaces: [], waited: 0) == .none)
++        precondition(RemotePairingChoice.choose(interfaces: [], waited: 100) == .none)
++
++        // Situation: only the phone's own service, on loopback.
++        precondition(RemotePairingChoice.choose(interfaces: [["lo0"]], waited: 0) == .loopback(0))
++
++        // Situation: an Apple TV on Wi-Fi answers first. Hold out for loopback instead of taking it.
++        let appleTVFirst = [["en0"]]
++        precondition(RemotePairingChoice.choose(interfaces: appleTVFirst, waited: 0) == .wait)
++        precondition(RemotePairingChoice.choose(interfaces: appleTVFirst, waited: wait - 0.1) == .wait)
++
++        // Situation: the loopback result arrives after the Apple TV's, and wins.
++        let loopbackSecond = [["en0"], ["lo0"]]
++        precondition(RemotePairingChoice.choose(interfaces: loopbackSecond, waited: 0.2) == .loopback(1))
++        precondition(RemotePairingChoice.choose(interfaces: loopbackSecond, waited: wait + 1) == .loopback(1))
++
++        // Situation: a result seen on several interfaces counts as loopback if one of them is.
++        precondition(RemotePairingChoice.choose(interfaces: [["en0"], ["en0", "lo0"]], waited: 0) == .loopback(1))
++
++        // Situation: nothing but other devices. After the wait, fall back to the first.
++        let others = [["en0"], ["awdl0"]]
++        precondition(RemotePairingChoice.choose(interfaces: others, waited: wait) == .fallback(0))
++        precondition(RemotePairingChoice.choose(interfaces: others, waited: wait + 2) == .fallback(0))
++
++        // Interface names: lo0 and friends are loopback, Wi-Fi and the VPN's utun are not.
++        precondition(RemotePairingChoice.isLoopback("lo0"))
++        precondition(!RemotePairingChoice.isLoopback("en0"))
++        precondition(!RemotePairingChoice.isLoopback("utun4"))
++
++        print("test_remote_pairing_choice: all passed")
++    }
++}

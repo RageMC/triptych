@@ -1,0 +1,120 @@
+diff --git a/ios/Henge/HengeLog.swift b/ios/Henge/HengeLog.swift
+index 624b847a..93e7fbab 100644
+--- a/ios/Henge/HengeLog.swift
++++ b/ios/Henge/HengeLog.swift
+@@ -365,9 +365,10 @@ enum HengeLog {
+         log("boot", "build       : \(version) (\(build)) \(commit) built \(built)")
+         log("boot", "pid         : \(getpid())")
+         log("boot", "log file    : \(logFileURL.path)")
+-        // Every iOS 27 device except iPad8,11/8,12 enforces TXM, which is what makes
+-        // the debugger-assisted JIT path mandatory rather than optional.
+-        log("boot", "TXM expected: \(Self.expectsTXM(model: model) ? "YES" : "no")")
++        // TXM is what makes the debugger-assisted JIT path mandatory rather than optional. The device tree says whether
++        // this device runs it; the model table is the fallback, and the two are logged together so a wrong entry shows.
++        let detected = TXMDetection.fromDeviceTree.map { $0 ? "YES" : "no" } ?? "unknown (device tree not readable)"
++        log("boot", "TXM         : \(detected); model table expects \(Self.expectsTXM(model: model) ? "YES" : "no")")
+         log("boot", "===============================================")
+     }
+ 
+diff --git a/ios/Henge/JIT/JITBootstrap.swift b/ios/Henge/JIT/JITBootstrap.swift
+index 5fa95d64..bb0fde3f 100644
+--- a/ios/Henge/JIT/JITBootstrap.swift
++++ b/ios/Henge/JIT/JITBootstrap.swift
+@@ -230,9 +230,9 @@ enum JITBootstrap {
+     }
+ 
+     /// Whether this device enforces TXM, so that only a trap servicer can grant
+-    /// executable memory. Uses the same rule as the "TXM expected" line in the
+-    /// log banner, so the two can never disagree.
+-    static let deviceEnforcesTXM: Bool = HengeLog.expectsTXM(model: HengeLog.deviceModel)
++    /// executable memory. Read from the device tree (TXMDetection); the model
++    /// table answers only when that cannot be read. The log banner's TXM line shows both.
++    static let deviceEnforcesTXM: Bool = TXMDetection.fromDeviceTree ?? HengeLog.expectsTXM(model: HengeLog.deviceModel)
+ 
+     /// Why the last prewarm failed, for the UI to show.
+     ///
+diff --git a/ios/Henge/JIT/JITSetup.swift b/ios/Henge/JIT/JITSetup.swift
+index 2818e5d7..e7c36895 100644
+--- a/ios/Henge/JIT/JITSetup.swift
++++ b/ios/Henge/JIT/JITSetup.swift
+@@ -339,6 +339,7 @@ final class JITCoordinator: ObservableObject {
+                     }
+                     busy = false
+                     txmPresent = response.txmPresent
++                    noteTXMAnswer(response.txmPresent)
+                     prepared = response.success
+                     status = response.success ? response.message : nil
+                     error = response.success ? nil : helperFailure(response.message)
+@@ -421,6 +422,14 @@ final class JITCoordinator: ObservableObject {
+         }
+     }
+ 
++    /// StikJIT reads TXM its own way. Log it when it disagrees with Henge's answer, so a wrong one shows in the log.
++    private func noteTXMAnswer(_ stikJIT: Bool?) {
++        guard let stikJIT, stikJIT != JITBootstrap.deviceEnforcesTXM else { return }
++        log("TXM: StikJIT says \(stikJIT ? "present" : "absent"), Henge assumed "
++            + "\(JITBootstrap.deviceEnforcesTXM ? "present" : "absent") (device tree: "
++            + "\(TXMDetection.fromDeviceTree.map { $0 ? "present" : "absent" } ?? "unreadable"))")
++    }
++
+     func resetDDI() {
+         busy = true
+         error = nil
+diff --git a/ios/Henge/JIT/TXMDetection.swift b/ios/Henge/JIT/TXMDetection.swift
+new file mode 100644
+index 00000000..2c0a5afd
+--- /dev/null
++++ b/ios/Henge/JIT/TXMDetection.swift
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++import Darwin
++import Foundation
++
++/// Whether this device runs the Trusted Execution Monitor, read from the device itself.
++///
++/// With TXM only an attached debugger that answers Henge's trap requests can grant executable memory, so it decides
++/// which JIT paths can work at all. The device tree says so directly: the boot loader lists the memory it carved out
++/// for TXM under /chosen/memory-map, as a property named "TXM", and only on devices that run it. Apps may read that
++/// node. The model table in HengeLog.expectsTXM stays as the answer when the device tree cannot be read.
++enum TXMDetection {
++    /// true or false when the device tree answered; nil when it could not be read.
++    static let fromDeviceTree: Bool? = readDeviceTree()
++
++    private typealias EntryFromPath = @convention(c) (mach_port_t, UnsafePointer<CChar>) -> UInt32
++    private typealias CreateProperty = @convention(c) (UInt32, CFString, CFAllocator?, UInt32) -> Unmanaged<CFTypeRef>?
++    private typealias Release = @convention(c) (UInt32) -> Int32
++
++    private static func readDeviceTree() -> Bool? {
++        // IOKit has no Swift module on iOS; its C functions are public and always present.
++        guard let iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW),
++              let fromPath = dlsym(iokit, "IORegistryEntryFromPath"),
++              let property = dlsym(iokit, "IORegistryEntryCreateCFProperty"),
++              let release = dlsym(iokit, "IOObjectRelease") else { return nil }
++        let entryFromPath = unsafeBitCast(fromPath, to: EntryFromPath.self)
++        let createProperty = unsafeBitCast(property, to: CreateProperty.self)
++        let objectRelease = unsafeBitCast(release, to: Release.self)
++
++        // kIOMainPortDefault is MACH_PORT_NULL.
++        let entry = entryFromPath(0, "IODeviceTree:/chosen/memory-map")
++        guard entry != 0 else { return nil }
++        defer { _ = objectRelease(entry) }
++        // kIORegistryEntryPropertyKeysKey: the node's property names, without reading their values.
++        guard let keys = createProperty(entry, "IORegistryEntryPropertyKeys" as CFString, nil, 0)?
++                .takeRetainedValue() as? [String] else { return nil }
++        return keys.contains("TXM")
++    }
++}
+diff --git a/ios/Henge/SettingsView.swift b/ios/Henge/SettingsView.swift
+index cab15deb..e74fd412 100644
+--- a/ios/Henge/SettingsView.swift
++++ b/ios/Henge/SettingsView.swift
+@@ -51,6 +51,9 @@ struct SettingsView: View {
+                             .font(.footnote).foregroundStyle(.secondary)
+                     }
+                     LabeledContent("Code region", value: "\(JITBootstrap.jitBytes >> 20) MB, claimed once per launch")
++                    LabeledContent("Trusted Execution Monitor", value: TXMDetection.fromDeviceTree == nil
++                                   ? (JITBootstrap.deviceEnforcesTXM ? "Expected for this model" : "Not expected for this model")
++                                   : (JITBootstrap.deviceEnforcesTXM ? "Present" : "Not present"))
+                 }
+                 .listRowBackground(Desk.card)
+                 Section("Memory") {

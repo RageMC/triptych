@@ -1,0 +1,102 @@
+diff --git a/tl/Makefile b/tl/Makefile
+index 4b8b8751..3e6a18a2 100644
+--- a/tl/Makefile
++++ b/tl/Makefile
+@@ -91,8 +91,8 @@ test-apps: all apps
+ 	  if echo "$$out" | grep -q '^PASS HelloAppKit' && echo "$$out" | grep -q 'was never loaded'; then echo "ok   HelloAppKit on the toy AppKit, no real AppKit: $$(echo "$$out" | grep '^window')"; \
+ 	  else echo "FAIL HelloAppKit on the toy AppKit"; echo "$$out" | sed 's/^/  /'; fi
+ 
+-$(B)/map_names: tests/map_names.c loader/tl_loader.c loader/tl_tlv.S loader/tl_stubs.m loader/tl_loader.h | $(B)
+-	$(CC) $(CFLAGS) -fobjc-arc tests/map_names.c loader/tl_loader.c loader/tl_tlv.S loader/tl_stubs.m -framework Foundation -o $@
++$(B)/map_names: tests/map_names.c loader/tl_loader.c loader/tl_tlv.S loader/tl_bundle.m loader/tl_stubs.m loader/tl_loader.h | $(B)
++	$(CC) $(CFLAGS) -fobjc-arc tests/map_names.c loader/tl_loader.c loader/tl_tlv.S loader/tl_bundle.m loader/tl_stubs.m -framework Foundation -o $@
+ 
+ test: all $(B)/map_names
+ 	@$(B)/map_names | sed 's/^PASS/ok  /'
+diff --git a/tl/loader/tl_bundle.m b/tl/loader/tl_bundle.m
+index 9583ca17..ae07aa40 100644
+--- a/tl/loader/tl_bundle.m
++++ b/tl/loader/tl_bundle.m
+@@ -13,12 +13,35 @@
+ 
+ /* The app's own code asking (objc_msgSend tail-calls this, so the return address is the caller's) gets the app's
+    bundle; anything else, the host included (Henge reads its own resources and build all launch), the host's. */
+-static NSBundle *main_bundle(id self, SEL _cmd) {
+-    void *caller = __builtin_return_address(0);
++static NSBundle *guest_bundle_for(void *caller) {
+     int ns = tl_ns_of_address(caller);
+     if (ns > 0 && ns < 64 && g_ns_bundles[ns]) return g_ns_bundles[ns];
+     if (g_bundle && (g_for_everyone || tl_image_containing(caller))) return g_bundle;
+-    return ((NSBundle * (*)(id, SEL))g_host_main_bundle)(self, _cmd);
++    return nil;
++}
++
++static NSBundle *main_bundle(id self, SEL _cmd) {
++    NSBundle *b = guest_bundle_for(__builtin_return_address(0));
++    return b ?: ((NSBundle * (*)(id, SEL))g_host_main_bundle)(self, _cmd);
++}
++
++/* CFBundleGetMainBundle for the app's own code: the loader binds the app's import of it here (see host_symbol). The
++   CFBundle of the bundle main_bundle() would give is made once and kept, as the real call's is. */
++void *tl_cf_main_bundle(void) {
++    NSBundle *b = guest_bundle_for(__builtin_return_address(0));
++    if (!b) return (void *)CFBundleGetMainBundle();
++    static NSMutableDictionary *made;
++    @synchronized([NSBundle class]) {
++        if (!made) made = [NSMutableDictionary new];
++        NSString *key = b.bundlePath;
++        CFBundleRef cf = (__bridge CFBundleRef)made[key];
++        if (!cf) {
++            cf = CFBundleCreate(NULL, (__bridge CFURLRef)b.bundleURL);
++            if (!cf) return (void *)CFBundleGetMainBundle();
++            made[key] = (__bridge_transfer id)cf;
++        }
++        return (void *)cf;
++    }
+ }
+ 
+ /* Processes started inside the app (processes as threads) each have their own app bundle (a helper's .app). */
+@@ -44,7 +67,6 @@ int tl_adopt_main_bundle(const char *app_path) {
+         Method m = class_getClassMethod([NSBundle class], @selector(mainBundle));
+         IMP old = method_setImplementation(m, (IMP)main_bundle);
+         if (old != (IMP)main_bundle) g_host_main_bundle = old;
+-        /* Not yet: CFBundleGetMainBundle() still answers the host's bundle (LiveContainer rewrites the CFBundle). */
+         return 0;
+     }
+ }
+diff --git a/tl/loader/tl_loader.c b/tl/loader/tl_loader.c
+index eeef61e8..e80e3770 100644
+--- a/tl/loader/tl_loader.c
++++ b/tl/loader/tl_loader.c
+@@ -696,6 +696,7 @@ static uint64_t image_export(TlImage *im, const char *sym, int *found) {
+ 
+ static uint64_t host_symbol(void *handle, const char *install_name, const char *sym, int *found) {
+     *found = 0;
++    if (!strcmp(sym, "_CFBundleGetMainBundle")) { *found = 1; return (uint64_t)tl_cf_main_bundle; }
+     if (!install_name || strstr(install_name, "libSystem") || !strncmp(install_name, "/usr/lib/system/", 16) ||
+         strstr(install_name, "/libbsm.") || strstr(install_name, "/libsandbox.")) {
+         void *s = tl_runtime_lookup(sym);
+diff --git a/tl/loader/tl_loader.h b/tl/loader/tl_loader.h
+index 021364bd..7e8f5318 100644
+--- a/tl/loader/tl_loader.h
++++ b/tl/loader/tl_loader.h
+@@ -84,6 +84,7 @@ void tl_main_bundle_for_everyone(void);
+ void tl_adopt_ns_bundle(int ns, const char *app_path);
+ /* The adopted bundle (an NSBundle *), or NULL: for host code acting for the app (Henge's AppKit). */
+ void *tl_main_bundle(void);
++void *tl_cf_main_bundle(void); /* the app's CFBundleGetMainBundle */
+ /* Calls the executable's main. */
+ int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp);
+ 
+diff --git a/tl/tests/fwapp.m b/tl/tests/fwapp.m
+index 1c39c34c..14e60c8d 100644
+--- a/tl/tests/fwapp.m
++++ b/tl/tests/fwapp.m
+@@ -18,6 +18,7 @@ int main(void) {
+         TLFWThing *t = [TLFWThing new];
+         printf("%s | %s | counter %d | add %d %d | loads %d\n", t.what.UTF8String, t.shouted.UTF8String, tlfw_counter,
+                tlfw_add(1, 2), tlfw_add(1, 2), [TLFWThing loads]);
++        printf("main bundle %s\n", [(__bridge NSString *)CFBundleGetIdentifier(CFBundleGetMainBundle()) UTF8String]);
+         printf("PASS fwapp\n");
+     }
+     return 0;

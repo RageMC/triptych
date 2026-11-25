@@ -1,0 +1,77 @@
+name: Bug / Diagnostic Report
+description: Report a crash, boot failure, or rendering/input bug in Triptych
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Tip:** Whenever possible, submit reports directly from **Curator** inside Triptych. Curator automatically collects device context, triages known signatures, and scrubs personal paths/tokens before posting to `RageMC/triptych-issues`.
+
+  - type: dropdown
+    id: system
+    attributes:
+      label: System / Engine
+      description: Which Triptych engine or view was running?
+      options:
+        - "Casement · Windows 11 ARM64 PC (winarm / Gesso)"
+        - "Pane · Windows apps & games (Madeira / Wine / FEX)"
+        - "Atelier · macOS VM (Gesso)"
+        - "Atelier · Mac apps & CrossOver (MacAppsKit / Gesso TL)"
+        - "Fresco · Linux terminal & desktop (LinuxRunner)"
+        - "x86 PC · QEMU x86_64"
+        - "Easel / JIT / Setup / Curator"
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Device & iOS/iPadOS Version
+      description: Device model identifier and OS build (e.g., iPad16,6 on iPadOS 27.2, or iOS Simulator on macOS)
+      placeholder: "iPad16,6 · iPadOS 27.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: jit
+    attributes:
+      label: Installation & JIT Source
+      options:
+        - "LiveContainer + StikDebug"
+        - "Sideloaded IPA + StikDebug"
+        - "Sideloaded IPA + Built-in StikJIT"
+        - "iOS Simulator (macOS host)"
+        - "No JIT / Interpreter"
+    validations:
+      required: true
+
+  - type: input
+    id: build
+    attributes:
+      label: Triptych Build / Commit
+      description: Commit SHA or version shown in About / Curator report
+      placeholder: "d78d9e3"
+    validations:
+      required: false
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What Happened & Steps to Reproduce
+      description: Describe the guest OS/app you ran, the steps taken, and the failure or crash observed.
+      placeholder: |
+        1. Opened Casement with Windows 11 ARM64 ISO...
+        2. Booted through UEFI into setup...
+        3. Observed bugcheck / crash...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Scrubbed Diagnostic Excerpt / Curator Output
+      description: Paste the scrubbed diagnostic summary from Curator or Provenance (ensure no personal /Users/ paths, emails, or tokens are included).
+      render: text
+    validations:
+      required: false

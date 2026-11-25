@@ -1,0 +1,47 @@
+From 1404d0fd75bad19bafbd5c9eafde8ca221994ba4 Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:18:34 -0500
+Subject: [PATCH] gicv3: SPI hook for a test tool's in-kernel GIC
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ devices/gicv3.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/devices/gicv3.c b/devices/gicv3.c
+index 61bce1e..d5bd678 100644
+--- a/devices/gicv3.c
++++ b/devices/gicv3.c
+@@ -257,7 +257,8 @@ static void icc_write_body(HvMachine *m, HvCpu *cpu, uint32_t reg, uint64_t v) {
+         if ((v & 0xffffff) < HV_GIC_NUM_IRQS) F(g, c, active, (int)(v & 0xffffff)) = 0;
+         break;
+     case R(3, 0, 12, 8, 3): k->bpr0 = v & 7; break;
+-    case R(3, 0, 12, 12, 3): k->bpr1 = v & 7; hv_trace(HVT_BPR1_W, v, 0); break;
++    case R(3, 0, 12, 12, 3): k->bpr1 = v & 7; hv_trace(HVT_BPR1_W, v, 0);
++break;
+     case R(3, 0, 12, 12, 4): k->icc_ctlr = v & 3; hv_trace(HVT_CTLR_W, v, 0); break;              /* CBPR, EOImode */
+     case R(3, 0, 12, 12, 6): k->igrpen0 = v & 1; break;
+     case R(3, 0, 12, 12, 7): k->igrpen1 = v & 1; hv_trace(HVT_IGRPEN1_W, v, 0); break;
+@@ -475,7 +476,11 @@ void hv_gicv3_update(HvGic *g) {
+     pthread_mutex_unlock(&g->mu);
+ }
+ 
++/* A test tool's in-kernel GIC (winvm's WINVM_HVF): when set, SPIs go there instead. */
++void (*hv_gicv3_spi_hook)(int intid, int level);
++
+ void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
++    if (hv_gicv3_spi_hook) { hv_gicv3_spi_hook(intid, level); return; }
+     pthread_mutex_lock(&g->mu);
+     hv_gicv3_set_irq_body(g, intid, level);
+     pthread_mutex_unlock(&g->mu);
+@@ -493,6 +498,7 @@ void hv_gicv3_set_ppi(HvGic *g, int c, int intid, int level) {
+ }
+ 
+ void hv_gicv3_pend(HvGic *g, int intid) {
++    if (hv_gicv3_spi_hook) { hv_gicv3_spi_hook(intid, 1); return; }
+     pthread_mutex_lock(&g->mu);
+     hv_gicv3_pend_body(g, intid);
+     pthread_mutex_unlock(&g->mu);
+-- 
+2.46.2
+

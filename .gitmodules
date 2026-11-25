@@ -1,0 +1,18 @@
+[submodule "upstreams/henge"]
+	path = upstreams/henge
+	url = https://github.com/Leviidev/Henge.git
+[submodule "upstreams/bcd-games"]
+	path = upstreams/bcd-games
+	url = https://github.com/thebcd69/bcd-games.git
+[submodule "upstreams/madeira"]
+	path = upstreams/madeira
+	url = https://github.com/willfaust/Madeira.git
+[submodule "upstreams/linuxrunner"]
+	path = upstreams/linuxrunner
+	url = https://github.com/mxhm11cr/LinuxRunner.git
+[submodule "upstreams/qemu"]
+	path = upstreams/qemu
+	url = https://github.com/utmapp/qemu.git
+[submodule "upstreams/llama.cpp"]
+	path = upstreams/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git

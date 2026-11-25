@@ -1,0 +1,86 @@
+From 011889376dd670150eeb1b0345cf8169187df26a Mon Sep 17 00:00:00 2001
+From: RageMC <24841174+RageMC@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:18:34 -0500
+Subject: [PATCH] exception: per-instruction watched-abort log; bugcheck
+ register, stack and memory dump
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/exception.c | 47 ++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/core/exception.c b/core/exception.c
+index 38ce49a..c95b39a 100644
+--- a/core/exception.c
++++ b/core/exception.c
+@@ -81,16 +81,25 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
+             fprintf(stderr, "henge: watching %s at %llx size %llx\n", nm, (unsigned long long)wbase, (unsigned long long)wsize);
+         }
+     }
+-    if (type == HV_EXC_SYNC && wsize && cpu->el == 1 && ret - wbase < wsize && nwatch < 300 &&
++    static uint32_t woff[64], wcnt[64];
++    int wslot = -1;
++    if (type == HV_EXC_SYNC && wsize && cpu->el == 1 && ret - wbase < wsize && nwatch < 2000 &&
+         ((esr >> 26) == HV_EC_DABT_SAME || (esr >> 26) == HV_EC_IABT_SAME)) {
++        /* At most 3 lines per instruction: the demand faults of a big buffer repeat at one spot and would hide the rest. */
++        uint32_t off = (uint32_t)(ret - wbase);
++        for (int i = 0; i < 64; i++) if (wcnt[i] == 0 || woff[i] == off) { woff[i] = off; wslot = i; break; }
++        if (wslot >= 0 && wcnt[wslot]++ >= 3) wslot = -1;
++    }
++    if (wslot >= 0) {
+         nwatch++;
+         uint32_t insn = 0; uint64_t ipa;
+         if (!hv_mmu_access(cpu, ret, HV_ACC_EXEC, 1, &ipa)) hv_phys_read(cpu->m, ipa, &insn, 4);
+         uint64_t fpa = 0;
+         uint32_t rewalk = hv_mmu_access(cpu, far, (esr >> 6) & 1 ? HV_ACC_WRITE : HV_ACC_READ, 1, &fpa); /* 0: maps now */
+-        fprintf(stderr, "henge: watched abort esr=%08x far=%llx pc=+%llx insn=%08x rewalk=%x pa=%llx x0=%llx x1=%llx\n", esr,
++        fprintf(stderr, "henge: watched abort esr=%08x far=%llx pc=+%llx insn=%08x rewalk=%x pa=%llx x0=%llx x1=%llx x19=%llx lr=+%llx\n", esr,
+                 (unsigned long long)far, (unsigned long long)(ret - wbase), insn, rewalk, (unsigned long long)fpa,
+-                (unsigned long long)cpu->x[0], (unsigned long long)cpu->x[1]);
++                (unsigned long long)cpu->x[0], (unsigned long long)cpu->x[1], (unsigned long long)cpu->x[19],
++                (unsigned long long)(cpu->x[30] - wbase));
+     }
+     if (type == HV_EXC_SYNC && esr >> 26 == HV_EC_BRK && (esr & 0xffff) == 0xf002 && cpu->el == 1 && cpu->x[16] != 3) { /* 3: symbol loads */
+         /* Windows' debug service (DbgPrint and friends): show its text, e.g. the bugcheck's "Fatal System Error". */
+@@ -110,6 +119,38 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
+                 fprintf(stderr, " | s%d \"%s\"", k, t);
+             }
+             fprintf(stderr, "\n");
++            if (cpu->x[16] == 4 && cpu->x[0] == 0) {
++                /* The bugcheck path: its code and parameters are somewhere in the callee-saved registers or the
++                   stack. Show both and the frame chain's return addresses. */
++                fprintf(stderr, "henge: bugcheck regs");
++                for (int r = 19; r <= 28; r++) fprintf(stderr, " x%d=%llx", r, (unsigned long long)cpu->x[r]);
++                fprintf(stderr, "\nhenge: bugcheck frames");
++                uint64_t fp = cpu->x[29], fr[2];
++                for (int d = 0; d < 10 && fp; d++) {
++                    if (hv_mmu_access(cpu, fp, HV_ACC_READ, 1, &pa) || hv_phys_read(cpu->m, pa, fr, 16)) break;
++                    fprintf(stderr, " %llx", (unsigned long long)fr[1]);
++                    fp = fr[0];
++                }
++                uint64_t stkp[9]; int nstkp = 0;
++                fprintf(stderr, "\nhenge: bugcheck stack");
++                for (int q = 0; q < 64; q++) {
++                    uint64_t v;
++                    if (hv_mmu_access(cpu, cpu->sp + 8 * q, HV_ACC_READ, 1, &pa) || hv_phys_read(cpu->m, pa, &v, 8)) break;
++                    fprintf(stderr, " %llx", (unsigned long long)v);
++                    if (q >= 14 && q <= 22 && (v >> 47) == 0x1ffff) stkp[nstkp < 9 ? nstkp++ : 8] = v;
++                }
++                fprintf(stderr, "\n");
++                /* What the bugcheck's addresses hold (the corrupted block among them): who wrote it shows in the bytes. */
++                for (int i = 0; i < nstkp; i++) {
++                    fprintf(stderr, "henge: bugcheck mem %llx:", (unsigned long long)stkp[i]);
++                    for (int q = -8; q < 40; q++) {
++                        uint64_t v, a = stkp[i] + 8 * q;
++                        if (hv_mmu_access(cpu, a, HV_ACC_READ, 1, &pa) || hv_phys_read(cpu->m, pa, &v, 8)) { fprintf(stderr, " -"); continue; }
++                        fprintf(stderr, "%s%llx", q == 0 ? " | " : " ", (unsigned long long)v);
++                    }
++                    fprintf(stderr, "\n");
++                }
++            }
+         }
+     }
+     if (cpu->m->trace || cpu->m->log >= 2)
+-- 
+2.46.2
+

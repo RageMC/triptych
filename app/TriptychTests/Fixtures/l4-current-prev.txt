@@ -1,0 +1,5 @@
+[  1307.36ms][henge-jit] #1: the JIT region came back at 0x7000b04000, above 0x7000000000 where generated code does not run; giving it back. Quit Henge and open it again.
+[henge-jit] prewarm FAILED: 1610612736 bytes
+[ 38613.83ms][henge-jit] #2: the JIT region came back at 0x7000b80000, above 0x7000000000 where generated code does not run; giving it back. Quit Henge and open it again.
+[ 86637.60ms][jit] JIT prewarm FAILED -- StikDebug is not servicing traps
+[126013.85ms][macapps] <app> returned -1: Turn on JIT first.
