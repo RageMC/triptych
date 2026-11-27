@@ -190,3 +190,7 @@ the process and how the work was checked.
 ## Support
 
 If Triptych is useful to you: [Ko-fi](https://ko-fi.com/ragemc) · [Buy Me a Coffee](https://buymeacoffee.com/RageMC)
+
+## Project ended (2026-11-26)
+
+Triptych is no longer developed and this repository is archived (read-only). The v0.1.0 release and all code stay here for anyone to reuse or fork.
